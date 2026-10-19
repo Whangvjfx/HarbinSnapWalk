@@ -89,7 +89,7 @@ final class RouteTrackingManager: ObservableObject {
         self.offRouteNotice = nil
     }
 
-    /// GPS 定位更新回调：智能判定是否在轨、防作弊、更新进度并检测是否完赛
+    /// GPS 定位更新回调：支持无障碍平地绕行宽容度、防作弊、自动豁免被绕开的障碍点并检测完赛
     func processGPSUpdate(
         newLocation: CLLocationCoordinate2D,
         gpsSpeedMps: Double,
@@ -98,42 +98,56 @@ final class RouteTrackingManager: ObservableObject {
     ) {
         guard isTracking, !isPaused, let route = activeRoute else { return }
 
-        // 1. 防作弊检测：如果瞬时 GPS 速度超过 18 km/h (5.0 m/s)，判定为乘坐车辆/单车，不计入有效步行
+        // 1. 防作弊检测：如果瞬时 GPS 速度超过 18 km/h (5.0 m/s)，判定为乘坐机动车，不计入有效步行
         let speedKmH = max(0, gpsSpeedMps * 3.6)
         if speedKmH > 18.0 {
             self.offRouteNotice = "⚠️ 检测到车速过快，已暂停步数与里程统计"
             return
         }
 
-        // 2. 距离累计与垂线距离计算
+        // 2. 距离累计与无障碍绕行走廊计算
         if let last = lastRecordedLocation {
             let segDist = distanceBetween(last, newLocation)
-            // 滤除漂移（单次点跳变 > 80m 不计）
+            // 滤除定位漂移（单次点跳变 > 80m 不计）
             if segDist < 80.0 {
-                // 计算当前点到规划路线的最短垂直距离
                 let minDistanceToRoute = minDistance(from: newLocation, to: checkpoints)
-                
-                if minDistanceToRoute <= 45.0 {
-                    // 正轨内（允许两侧人行道与路边 45 米内）
+
+                if minDistanceToRoute <= 90.0 {
+                    // 无障碍全额走廊（90 米内：允许走对侧人行道、绕开施工围挡或前往邻近地面斑马线平交过街）
                     self.completedDistanceMeters += segDist
                     self.offRouteNotice = nil
-                } else if minDistanceToRoute <= 120.0 {
-                    // 轻微偏航，给予 60% 折扣累计并提醒
-                    self.completedDistanceMeters += segDist * 0.6
-                    self.offRouteNotice = "您稍偏离了规划路线，请注意街巷走向"
+                } else if minDistanceToRoute <= 220.0 {
+                    // 宽容绕障缓冲带（90~220 米：允许大范围绕开天桥/封闭门禁，按 85% 折算里程）
+                    self.completedDistanceMeters += segDist * 0.85
+                    self.offRouteNotice = "正在绕行缓冲带内（若遇障碍/天桥可安心绕行，重回主路自动衔接）"
                 } else {
-                    // 彻底偏航 (>120米)，不累计进度
-                    self.offRouteNotice = "已偏离路线超过 120 米，请回到路线上"
+                    // 偏离超过 220 米，提示回到路线或点击「中途改线」
+                    self.offRouteNotice = "已偏离路线超 220 米，可回到主路或点击下方「中途改线」"
                 }
             }
         }
         self.lastRecordedLocation = newLocation
 
-        // 3. 推进检查点进度
+        // 3. 推进检查点进度 + 无障碍前向跳点自动豁免（若因避开天桥/路障绕过了中间 1~4 个检查点，回到前方路线时自动补齐）
+        var newlyReachedIndices: [Int] = []
         for (idx, cp) in checkpoints.enumerated() {
             if !visitedCheckpointIndices.contains(idx) {
-                if distanceBetween(newLocation, cp) <= 45.0 {
+                if distanceBetween(newLocation, cp) <= 75.0 {
                     visitedCheckpointIndices.insert(idx)
+                    newlyReachedIndices.append(idx)
+                }
+            }
+        }
+
+        // 前向跳点自动豁免：当用户绕过某个障碍重新踏上前方检查点 idx 时，若 idx 前方最多 4 个检查点内已有已打卡点，则自动豁免中间被绕开的障碍点
+        for idx in newlyReachedIndices {
+            let lookbackStart = max(0, idx - 5)
+            if lookbackStart < idx {
+                let hasPriorVisited = (lookbackStart..<idx).contains { visitedCheckpointIndices.contains($0) } || idx <= 2
+                if hasPriorVisited {
+                    for bypassed in lookbackStart..<idx {
+                        visitedCheckpointIndices.insert(bypassed)
+                    }
                 }
             }
         }
@@ -142,10 +156,10 @@ final class RouteTrackingManager: ObservableObject {
             self.progressRate = min(1.0, Double(visitedCheckpointIndices.count) / Double(checkpoints.count))
         }
 
-        // 4. 自动完赛判定：覆盖度 >= 80% 且到达终点判定圈（<=50米）
+        // 4. 自动完赛判定：覆盖度 >= 78% 且到达终点判定圈（<= 65米）或覆盖度 >= 94%
         if let endCoord = route.endCoordinate {
             let distToEnd = distanceBetween(newLocation, endCoord)
-            if (progressRate >= 0.80 && distToEnd <= 50.0) || (progressRate >= 0.95) {
+            if (progressRate >= 0.78 && distToEnd <= 65.0) || (progressRate >= 0.94) {
                 stopWorkout(userProfile: userProfile, completedNaturally: true, recordStore: recordStore)
             }
         }

@@ -6,7 +6,7 @@ import CoreLocation
 final class RouteSnapEngine: ObservableObject {
     @Published var isSnapping = false
     @Published var currentResult: SnappedRouteResult?
-    @Published var statusMessage: String = "随手画个圈或折线，秒级贴合路网"
+    @Published var statusMessage: String = "随手画个圈或折线，秒级贴合无障碍平路"
 
     /// 局部平面米制坐标（用于高速、高精度的几何小枝拓扑消解）
     private struct PlanarPoint {
@@ -15,7 +15,26 @@ final class RouteSnapEngine: ObservableObject {
         let coord: CLLocationCoordinate2D
     }
 
-    /// 核心入口：将原始手绘屏幕坐标解析为地理序列并吸附至街道，100% 根除所有中间锚点单枝与死胡同折返
+    /// 无障碍障碍物关键词库（天桥、地下通道、台阶等对行动不便人士不友好的设施）
+    private let barrierKeywords: [(keyword: String, label: String)] = [
+        ("人行天桥", "人行天桥"),
+        ("过街天桥", "过街天桥"),
+        ("天桥", "人行天桥"),
+        ("人行桥", "人行桥"),
+        ("地下通道", "地下通道"),
+        ("过街地道", "地下通道"),
+        ("地道", "地下通道"),
+        ("台阶", "台阶路段"),
+        ("阶梯", "台阶路段"),
+        ("步梯", "台阶路段"),
+        ("扶梯", "扶梯/天桥"),
+        ("连廊", "空中连廊"),
+        ("Overpass", "人行天桥"),
+        ("Underpass", "地下通道"),
+        ("Stairs", "台阶路段")
+    ]
+
+    /// 核心入口：将原始手绘屏幕坐标解析为地理序列并吸附至街道，100% 根除所有中间锚点单枝与死胡同折返，并优先筛选无天桥/无台阶的平地路线
     func snapUserSketchToRoads(
         rawCoordinates: [CLLocationCoordinate2D],
         strideLength: Double
@@ -26,7 +45,7 @@ final class RouteSnapEngine: ObservableObject {
         }
 
         self.isSnapping = true
-        self.statusMessage = "正在自动贴合真实街道路网..."
+        self.statusMessage = "正在贴合真实街道路网并筛选无天桥平路..."
         defer { self.isSnapping = false }
 
         // 0. 去除起笔收笔毛刺抖动
@@ -55,10 +74,12 @@ final class RouteSnapEngine: ObservableObject {
             return
         }
 
-        // 3. 串联发起步行路径吸附
+        // 3. 串联发起步行路径吸附（开启备选路线，自动优选无天桥/无地下通道/无台阶的平地路线）
         var rawLegs: [[CLLocationCoordinate2D]] = []
         var rawTravelTimeSeconds: TimeInterval = 0.0
         var rawTotalDistance: Double = 0.0
+        var candidateBarrierAlerts: [RouteBarrierAlert] = []
+        var totalAvoidedBarriers: Int = 0
 
         do {
             for i in 0..<(anchors.count - 1) {
@@ -69,16 +90,22 @@ final class RouteSnapEngine: ObservableObject {
                 req.source = MKMapItem(placemark: MKPlacemark(coordinate: startPoint))
                 req.destination = MKMapItem(placemark: MKPlacemark(coordinate: endPoint))
                 req.transportType = .walking
-                req.requestsAlternateRoutes = false
+                // 开启多条备选路线，以便对比并剔除含人行天桥、地下通道或台阶的路线
+                req.requestsAlternateRoutes = true
 
                 let directions = MKDirections(request: req)
                 let response = try await directions.calculate()
-                if let leg = response.routes.first {
-                    let coords = extractCoordinates(from: leg.polyline)
+                if !response.routes.isEmpty {
+                    let selection = selectBestAccessibleRoute(from: response.routes)
+                    let chosenRoute = selection.route
+                    totalAvoidedBarriers += selection.avoidedCount
+                    candidateBarrierAlerts.append(contentsOf: selection.remainingAlerts)
+
+                    let coords = extractCoordinates(from: chosenRoute.polyline)
                     if coords.count >= 2 {
                         rawLegs.append(coords)
-                        rawTravelTimeSeconds += leg.expectedTravelTime
-                        rawTotalDistance += leg.distance
+                        rawTravelTimeSeconds += chosenRoute.expectedTravelTime
+                        rawTotalDistance += chosenRoute.distance
                     }
                 }
             }
@@ -101,6 +128,9 @@ final class RouteSnapEngine: ObservableObject {
                 return
             }
 
+            // 过滤仅保留仍然在最终纯净路线上的天桥/通道提醒（有些天桥恰好在被剪除的单枝上，已被一并消除）
+            let activeAlerts = filterAlertsOnFinalRoute(alerts: candidateBarrierAlerts, routeCoords: cleanedCoords)
+
             // 重新计算剔除单枝后的真实纯净里程与预计用时
             let finalDistance = calculateTotalDistance(cleanedCoords)
             let paceRatio = rawTotalDistance > 10.0 ? (finalDistance / rawTotalDistance) : 1.0
@@ -113,13 +143,106 @@ final class RouteSnapEngine: ObservableObject {
                 totalDistanceMeters: finalDistance,
                 estimatedTravelSeconds: adjustedSeconds,
                 strideLength: strideLength,
-                shape: isLoopIntent ? .loop : .open
+                shape: isLoopIntent ? .loop : .open,
+                barrierAlerts: activeAlerts,
+                avoidedBarrierCount: totalAvoidedBarriers
             )
 
-            self.statusMessage = isLoopIntent ? "已识别为环形闭环路线（已净除分叉单枝）" : "已识别为单向通行路线（已净除分叉单枝）"
+            let routeTypeLabel = isLoopIntent ? "环形闭环" : "单向路线"
+            if !activeAlerts.isEmpty {
+                self.statusMessage = "⚠️ \(routeTypeLabel)：含 \(activeAlerts.count) 处天桥/通道(已标橙色，可走平地斑马线绕行)"
+            } else if totalAvoidedBarriers > 0 {
+                self.statusMessage = "✅ \(routeTypeLabel)：已自动为您避开 \(totalAvoidedBarriers) 处天桥/地下通道，全程平路"
+            } else {
+                self.statusMessage = "✅ \(routeTypeLabel)：全程平地人行道，无天桥/地下通道"
+            }
         } catch {
             self.statusMessage = "部分路段受限于小区围墙或封闭街区，已尽力吸附"
         }
+    }
+
+    // MARK: - 无障碍平路优选器（自动规避天桥、地下通道与台阶）
+    private func selectBestAccessibleRoute(
+        from routes: [MKRoute]
+    ) -> (route: MKRoute, remainingAlerts: [RouteBarrierAlert], avoidedCount: Int) {
+        var analyzed: [(route: MKRoute, alerts: [RouteBarrierAlert])] = []
+
+        for r in routes {
+            let alerts = detectBarriers(in: r)
+            analyzed.append((route: r, alerts: alerts))
+        }
+
+        let firstAlertsCount = analyzed.first?.alerts.count ?? 0
+
+        // 优先选择 0 障碍（无天桥、无地下通道、无台阶）且距离不过分绕远的备选路线
+        let shortestDist = routes.map { $0.distance }.min() ?? 1.0
+        let sorted = analyzed.sorted { a, b in
+            if a.alerts.count != b.alerts.count {
+                return a.alerts.count < b.alerts.count
+            }
+            return a.route.distance < b.route.distance
+        }
+
+        if let best = sorted.first {
+            // 如果最佳无障碍路线比最短路线绕行不超过 80%（或增量 <= 600 米），果断采用无障碍路线
+            if best.route.distance <= shortestDist * 1.80 || (best.route.distance - shortestDist) <= 600.0 {
+                let avoided = max(0, firstAlertsCount - best.alerts.count)
+                return (best.route, best.alerts, avoided)
+            }
+        }
+
+        let fallback = analyzed[0]
+        return (fallback.route, fallback.alerts, 0)
+    }
+
+    private func detectBarriers(in route: MKRoute) -> [RouteBarrierAlert] {
+        var alerts: [RouteBarrierAlert] = []
+
+        for step in route.steps {
+            let text = step.instructions + " " + (step.notice ?? "")
+            for item in barrierKeywords {
+                if text.localizedCaseInsensitiveContains(item.keyword) {
+                    let stepCoords = extractCoordinates(from: step.polyline)
+                    if let coord = stepCoords.first {
+                        alerts.append(
+                            RouteBarrierAlert(
+                                coordinate: coord,
+                                title: item.label,
+                                instruction: step.instructions.isEmpty ? "请注意此处可能有\(item.label)，可走附近平地斑马线绕行" : step.instructions
+                            )
+                        )
+                    }
+                    break
+                }
+            }
+        }
+        return alerts
+    }
+
+    private func filterAlertsOnFinalRoute(
+        alerts: [RouteBarrierAlert],
+        routeCoords: [CLLocationCoordinate2D]
+    ) -> [RouteBarrierAlert] {
+        guard !alerts.isEmpty, !routeCoords.isEmpty else { return [] }
+        var valid: [RouteBarrierAlert] = []
+
+        for alert in alerts {
+            // 仅当该天桥/通道坐标距离最终保留的路线 <= 30 米，且不与已有提示点重复时才保留
+            var isOnRoute = false
+            for pt in routeCoords {
+                if distanceBetween(alert.coordinate, pt) <= 30.0 {
+                    isOnRoute = true
+                    break
+                }
+            }
+            if isOnRoute {
+                let isDuplicate = valid.contains { distanceBetween($0.coordinate, alert.coordinate) <= 45.0 }
+                if !isDuplicate {
+                    valid.append(alert)
+                }
+            }
+        }
+        return valid
     }
 
     // MARK: - 1. 智能闭环意图判定

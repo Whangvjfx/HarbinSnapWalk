@@ -99,6 +99,27 @@ struct MainMapView: View {
                                     .shadow(color: .red.opacity(0.5), radius: 6)
                                 }
                             }
+
+                            // 无障碍提醒标记（若某处无法避开人行天桥/地下通道/台阶，醒目提示可走附近平地斑马线）
+                            ForEach(route.barrierAlerts) { alert in
+                                Annotation(alert.title, coordinate: alert.coordinate) {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .font(.system(size: 10, weight: .bold))
+                                        Text(alert.title)
+                                            .font(.system(size: 10, weight: .bold))
+                                    }
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        Capsule(style: .continuous)
+                                            .fill(Color.orange)
+                                            .overlay(Capsule().stroke(Color.white, lineWidth: 1))
+                                            .shadow(color: .orange.opacity(0.45), radius: 4, y: 2)
+                                    )
+                                }
+                            }
                         }
                     }
                     .mapControls {

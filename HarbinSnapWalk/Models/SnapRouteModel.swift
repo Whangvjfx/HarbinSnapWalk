@@ -33,6 +33,14 @@ struct RouteDirectionArrow: Identifiable {
     let bearingDegrees: Double
 }
 
+/// 无障碍风险提示点（如无法避开的人行天桥、地下通道或台阶路段）
+struct RouteBarrierAlert: Identifiable {
+    let id = UUID()
+    let coordinate: CLLocationCoordinate2D
+    let title: String
+    let instruction: String
+}
+
 struct SnappedRouteResult {
     let polylines: [MKPolyline]
     let anchorWaypoints: [CLLocationCoordinate2D]
@@ -40,6 +48,8 @@ struct SnappedRouteResult {
     let estimatedTravelSeconds: TimeInterval
     let strideLength: Double
     let shape: RouteShape
+    var barrierAlerts: [RouteBarrierAlert] = []
+    var avoidedBarrierCount: Int = 0
 
     var startCoordinate: CLLocationCoordinate2D? {
         anchorWaypoints.first
