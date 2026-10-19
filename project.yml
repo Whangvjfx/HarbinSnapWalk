@@ -3,7 +3,7 @@ options:
   bundleIdPrefix: com.heu.snapwalk
   deploymentTarget:
     iOS: "17.0"
-  xcodeVersion: "15.0"
+  xcodeVersion: "16.0"
 
 targets:
   HarbinSnapWalk:

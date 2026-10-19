@@ -18,3 +18,7 @@ xcuserdata/
 Payload/
 *.dSYM.zip
 *.dSYM
+
+# Local scripts
+*.py
+
