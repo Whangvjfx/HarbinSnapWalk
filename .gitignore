@@ -1,0 +1,20 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+!default.sublime-project
+*.xcuserstate
+project.xcworkspace/
+xcuserdata/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Archives & IPAs
+*.ipa
+Payload/
+*.dSYM.zip
+*.dSYM
