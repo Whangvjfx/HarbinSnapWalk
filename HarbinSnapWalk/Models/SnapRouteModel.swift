@@ -125,7 +125,7 @@ struct SnappedRouteResult {
     }
 
     /// 沿路线按真实里程均匀分布的透明行进方向小箭头（每 90 米一个，按插值精确定位）
-    private static func buildArrows(polylines: [MKPolyline]) -> [RouteDirectionArrow] {
+    static func buildArrows(polylines: [MKPolyline]) -> [RouteDirectionArrow] {
         let coords = coordinates(of: polylines)
         guard coords.count >= 2 else { return [] }
 

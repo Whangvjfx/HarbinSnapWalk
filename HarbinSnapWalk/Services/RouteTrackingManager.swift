@@ -402,9 +402,13 @@ final class RouteTrackingManager: ObservableObject {
 
             self.cityName = session.cityName
             self.activeRoute = restoredRoute
+            self.fullRouteResult = restoredRoute
+            self.showFullCompletedRoute = false
             self.routeCoords = restoredRoute.allRouteCoordinates
             self.routeLengthMeters = restoredRoute.totalDistanceMeters
-            self.checkpoints = extractCheckpoints(from: routeCoords, stepMeters: 60.0)
+            let extracted = extractCheckpoints(from: routeCoords, stepMeters: 60.0)
+            self.checkpoints = extracted.checkpoints
+            self.checkpointCoordIndices = extracted.indices
             self.nextCheckpointIndex = session.nextCheckpointIndex
             self.skippedCheckpointCount = session.skippedCheckpointCount
             self.hasAcquiredRoute = session.hasAcquiredRoute
