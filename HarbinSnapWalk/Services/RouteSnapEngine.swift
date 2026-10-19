@@ -6,7 +6,7 @@ import CoreLocation
 final class RouteSnapEngine: ObservableObject {
     @Published var isSnapping = false
     @Published var currentResult: SnappedRouteResult?
-    @Published var statusMessage: String = "随手画个圈或折线，秒级贴合无障碍平路"
+    @Published var statusMessage: String = "随手画个圈或折线，秒级贴合双侧人行道平路"
 
     /// 局部平面米制坐标（用于高速、高精度的几何小枝拓扑消解）
     private struct PlanarPoint {
@@ -15,8 +15,33 @@ final class RouteSnapEngine: ObservableObject {
         let coord: CLLocationCoordinate2D
     }
 
-    /// 无障碍障碍物关键词库（天桥、地下通道、台阶等对行动不便人士不友好的设施）
-    private let barrierKeywords: [(keyword: String, label: String)] = [
+    /// 1. 严禁/尽量规避的纯车行道与人车混行高危路段关键词（高架、隧道、匝道、快速路主路、无步道公路等）
+    private let vehicleOnlyKeywords: [(keyword: String, label: String)] = [
+        ("高架", "高架车行道"),
+        ("快速路", "城市快速路"),
+        ("高速", "高速车行道"),
+        ("匝道", "立交匝道"),
+        ("立交桥", "立交车行道"),
+        ("立交", "立交匝道"),
+        ("隧道", "车行隧道"),
+        ("涵洞", "涵洞路段"),
+        ("机动车道", "机动车道"),
+        ("车行道", "纯车行道"),
+        ("无人行道", "无人行道"),
+        ("无步道", "无人行步道"),
+        ("主路", "干道主路"),
+        ("绕城", "绕城公路"),
+        ("国道", "国道公路"),
+        ("省道", "省道公路"),
+        ("Expressway", "快速车行道"),
+        ("Highway", "高速车行道"),
+        ("Tunnel", "隧道车行道"),
+        ("Ramp", "匝道"),
+        ("Viaduct", "高架桥")
+    ]
+
+    /// 2. 无障碍垂直通行障碍关键词（人行天桥、地下通道、台阶等）
+    private let verticalBarrierKeywords: [(keyword: String, label: String)] = [
         ("人行天桥", "人行天桥"),
         ("过街天桥", "过街天桥"),
         ("天桥", "人行天桥"),
@@ -29,12 +54,20 @@ final class RouteSnapEngine: ObservableObject {
         ("步梯", "台阶路段"),
         ("扶梯", "扶梯/天桥"),
         ("连廊", "空中连廊"),
+        ("渡轮", "轮渡路段"),
         ("Overpass", "人行天桥"),
         ("Underpass", "地下通道"),
         ("Stairs", "台阶路段")
     ]
 
-    /// 核心入口：将原始手绘屏幕坐标解析为地理序列并吸附至街道，100% 根除所有中间锚点单枝与死胡同折返，并优先筛选无天桥/无台阶的平地路线
+    /// 3. 双侧人行道/行人友好街道正向特征关键词（用于备选路线加分优选）
+    private let sidewalkFriendlyKeywords: [String] = [
+        "人行道", "人行横道", "斑马线", "步行街", "步道", "绿道", "林荫", "辅路", "辅道", "公园", "广场"
+    ]
+
+    /// 核心入口：将原始手绘屏幕坐标解析为地理序列并吸附至街道
+    /// - 100% 根除所有中间锚点单枝与死胡同折返
+    /// - 优先筛选两侧有人行道的城市生活街道，主动规避纯车行高架、隧道、匝道及人行天桥/台阶
     func snapUserSketchToRoads(
         rawCoordinates: [CLLocationCoordinate2D],
         strideLength: Double
@@ -45,7 +78,7 @@ final class RouteSnapEngine: ObservableObject {
         }
 
         self.isSnapping = true
-        self.statusMessage = "正在贴合真实街道路网并筛选无天桥平路..."
+        self.statusMessage = "正在优选双侧人行道平路并避开车行干道..."
         defer { self.isSnapping = false }
 
         // 0. 去除起笔收笔毛刺抖动
@@ -74,31 +107,41 @@ final class RouteSnapEngine: ObservableObject {
             return
         }
 
-        // 3. 串联发起步行路径吸附（开启备选路线，自动优选无天桥/无地下通道/无台阶的平地路线）
+        // 3. 串联发起步行路径吸附（开启多备选路线 + 锚点微移避让高架/车行道）
         var rawLegs: [[CLLocationCoordinate2D]] = []
         var rawTravelTimeSeconds: TimeInterval = 0.0
         var rawTotalDistance: Double = 0.0
         var candidateBarrierAlerts: [RouteBarrierAlert] = []
-        var totalAvoidedBarriers: Int = 0
+        var totalAvoidedHazards: Int = 0
 
         do {
             for i in 0..<(anchors.count - 1) {
                 let startPoint = anchors[i]
-                let endPoint = anchors[i + 1]
+                var endPoint = anchors[i + 1]
+                let isIntermediateEnd = (i + 1) < (anchors.count - 1)
 
-                let req = MKDirections.Request()
-                req.source = MKMapItem(placemark: MKPlacemark(coordinate: startPoint))
-                req.destination = MKMapItem(placemark: MKPlacemark(coordinate: endPoint))
-                req.transportType = .walking
-                // 开启多条备选路线，以便对比并剔除含人行天桥、地下通道或台阶的路线
-                req.requestsAlternateRoutes = true
+                var selection = try await requestBestPedestrianRoute(from: startPoint, to: endPoint)
 
-                let directions = MKDirections(request: req)
-                let response = try await directions.calculate()
-                if !response.routes.isEmpty {
-                    let selection = selectBestAccessibleRoute(from: response.routes)
-                    let chosenRoute = selection.route
-                    totalAvoidedBarriers += selection.avoidedCount
+                // 如果当前段所有备选路线仍被迫走上纯车行道（高架/隧道/匝道）或天桥，且终点是手绘中间锚点：
+                // 自动尝试将该中间锚点向两侧垂直微移 85 米（移出高架/主干道中央，落回两侧有人行道的街道）重新寻路！
+                if selection.penaltyScore > 0 && isIntermediateEnd {
+                    let nudgedCandidates = generateSidewalkNudgeCandidates(from: startPoint, target: endPoint, offsetMeters: 85.0)
+                    for nudgedEnd in nudgedCandidates {
+                        if let altSelection = try? await requestBestPedestrianRoute(from: startPoint, to: nudgedEnd),
+                           altSelection.penaltyScore < selection.penaltyScore {
+                            selection = altSelection
+                            endPoint = nudgedEnd
+                            anchors[i + 1] = nudgedEnd
+                            totalAvoidedHazards += 1
+                            if selection.penaltyScore == 0 {
+                                break
+                            }
+                        }
+                    }
+                }
+
+                if let chosenRoute = selection.route {
+                    totalAvoidedHazards += selection.avoidedCount
                     candidateBarrierAlerts.append(contentsOf: selection.remainingAlerts)
 
                     let coords = extractCoordinates(from: chosenRoute.polyline)
@@ -128,7 +171,7 @@ final class RouteSnapEngine: ObservableObject {
                 return
             }
 
-            // 过滤仅保留仍然在最终纯净路线上的天桥/通道提醒（有些天桥恰好在被剪除的单枝上，已被一并消除）
+            // 过滤仅保留仍然在最终纯净路线上的无障碍/车行道提醒
             let activeAlerts = filterAlertsOnFinalRoute(alerts: candidateBarrierAlerts, routeCoords: cleanedCoords)
 
             // 重新计算剔除单枝后的真实纯净里程与预计用时
@@ -145,78 +188,214 @@ final class RouteSnapEngine: ObservableObject {
                 strideLength: strideLength,
                 shape: isLoopIntent ? .loop : .open,
                 barrierAlerts: activeAlerts,
-                avoidedBarrierCount: totalAvoidedBarriers
+                avoidedBarrierCount: totalAvoidedHazards
             )
 
             let routeTypeLabel = isLoopIntent ? "环形闭环" : "单向路线"
             if !activeAlerts.isEmpty {
-                self.statusMessage = "⚠️ \(routeTypeLabel)：含 \(activeAlerts.count) 处天桥/通道(已标橙色，可走平地斑马线绕行)"
-            } else if totalAvoidedBarriers > 0 {
-                self.statusMessage = "✅ \(routeTypeLabel)：已自动为您避开 \(totalAvoidedBarriers) 处天桥/地下通道，全程平路"
+                self.statusMessage = "⚠️ \(routeTypeLabel)：含 \(activeAlerts.count) 处天桥/车行段(地图已标橙色，可沿人行道绕行)"
+            } else if totalAvoidedHazards > 0 {
+                self.statusMessage = "✅ \(routeTypeLabel)：已自动避开 \(totalAvoidedHazards) 处车行道/天桥，优选双侧人行道"
             } else {
-                self.statusMessage = "✅ \(routeTypeLabel)：全程平地人行道，无天桥/地下通道"
+                self.statusMessage = "✅ \(routeTypeLabel)：已优选两侧带人行道的平地街道，无车行高架/天桥"
             }
         } catch {
-            self.statusMessage = "部分路段受限于小区围墙或封闭街区，已尽力吸附"
+            self.statusMessage = "部分路段受限于小区围墙或封闭街区，已尽力吸附人行步道"
         }
     }
 
-    // MARK: - 无障碍平路优选器（自动规避天桥、地下通道与台阶）
-    private func selectBestAccessibleRoute(
-        from routes: [MKRoute]
-    ) -> (route: MKRoute, remainingAlerts: [RouteBarrierAlert], avoidedCount: Int) {
-        var analyzed: [(route: MKRoute, alerts: [RouteBarrierAlert])] = []
+    // MARK: - 行人步道优选与车行道/天桥规避引擎
 
-        for r in routes {
-            let alerts = detectBarriers(in: r)
-            analyzed.append((route: r, alerts: alerts))
+    private struct RouteEvaluationResult {
+        let route: MKRoute?
+        let remainingAlerts: [RouteBarrierAlert]
+        let avoidedCount: Int
+        let penaltyScore: Int
+    }
+
+    /// 请求两点间步行路线，并在多条备选方案中综合评分，严厉排斥纯车行道（高架/隧道/匝道）与天桥台阶，优先选择双侧人行道街道
+    private func requestBestPedestrianRoute(
+        from startPoint: CLLocationCoordinate2D,
+        to endPoint: CLLocationCoordinate2D
+    ) async throws -> RouteEvaluationResult {
+        let req = MKDirections.Request()
+        req.source = MKMapItem(placemark: MKPlacemark(coordinate: startPoint))
+        req.destination = MKMapItem(placemark: MKPlacemark(coordinate: endPoint))
+        req.transportType = .walking
+        req.requestsAlternateRoutes = true
+
+        let directions = MKDirections(request: req)
+        let response = try await directions.calculate()
+        let routes = response.routes
+        guard !routes.isEmpty else {
+            return RouteEvaluationResult(route: nil, remainingAlerts: [], avoidedCount: 0, penaltyScore: 999)
         }
 
-        let firstAlertsCount = analyzed.first?.alerts.count ?? 0
+        struct ScoredCandidate {
+            let route: MKRoute
+            let alerts: [RouteBarrierAlert]
+            let penaltyScore: Int
+            let sidewalkBonus: Int
+        }
 
-        // 优先选择 0 障碍（无天桥、无地下通道、无台阶）且距离不过分绕远的备选路线
+        var candidates: [ScoredCandidate] = []
+        for r in routes {
+            let eval = evaluateRouteForPedestrianSidewalks(r)
+            candidates.append(
+                ScoredCandidate(
+                    route: r,
+                    alerts: eval.alerts,
+                    penaltyScore: eval.penaltyScore,
+                    sidewalkBonus: eval.sidewalkBonus
+                )
+            )
+        }
+
+        let defaultAlertsCount = candidates.first?.alerts.count ?? 0
         let shortestDist = routes.map { $0.distance }.min() ?? 1.0
-        let sorted = analyzed.sorted { a, b in
-            if a.alerts.count != b.alerts.count {
-                return a.alerts.count < b.alerts.count
+
+        // 排序准则：
+        // 1. 惩罚分（车行道 +100/处，天桥台阶 +60/处）越低越优先
+        // 2. 同为 0 惩罚时，人行道正向特征分（sidewalkBonus）越高越优先
+        // 3. 其次选路程更紧凑的方案
+        let sorted = candidates.sorted { a, b in
+            if a.penaltyScore != b.penaltyScore {
+                return a.penaltyScore < b.penaltyScore
+            }
+            if a.sidewalkBonus != b.sidewalkBonus {
+                return a.sidewalkBonus > b.sidewalkBonus
             }
             return a.route.distance < b.route.distance
         }
 
         if let best = sorted.first {
-            // 如果最佳无障碍路线比最短路线绕行不超过 80%（或增量 <= 600 米），果断采用无障碍路线
-            if best.route.distance <= shortestDist * 1.80 || (best.route.distance - shortestDist) <= 600.0 {
-                let avoided = max(0, firstAlertsCount - best.alerts.count)
-                return (best.route, best.alerts, avoided)
+            // 允许为了避开车行道/天桥而合理绕行（距离不超过最短路线 1.85 倍或增量 <= 650 米）
+            if best.route.distance <= shortestDist * 1.85 || (best.route.distance - shortestDist) <= 650.0 {
+                let avoided = max(0, defaultAlertsCount - best.alerts.count)
+                return RouteEvaluationResult(
+                    route: best.route,
+                    remainingAlerts: best.alerts,
+                    avoidedCount: avoided,
+                    penaltyScore: best.penaltyScore
+                )
             }
         }
 
-        let fallback = analyzed[0]
-        return (fallback.route, fallback.alerts, 0)
+        let first = candidates[0]
+        return RouteEvaluationResult(
+            route: first.route,
+            remainingAlerts: first.alerts,
+            avoidedCount: 0,
+            penaltyScore: first.penaltyScore
+        )
     }
 
-    private func detectBarriers(in route: MKRoute) -> [RouteBarrierAlert] {
+    /// 深度剖析单条路线的所有路段指令与告示：检验是否误入纯车行道、是否含天桥台阶、是否具备良好人行道
+    private func evaluateRouteForPedestrianSidewalks(
+        _ route: MKRoute
+    ) -> (alerts: [RouteBarrierAlert], penaltyScore: Int, sidewalkBonus: Int) {
         var alerts: [RouteBarrierAlert] = []
+        var penaltyScore = 0
+        var sidewalkBonus = 0
+
+        let routeNotices = route.advisoryNotices.joined(separator: " ")
+        for item in vehicleOnlyKeywords {
+            if routeNotices.localizedCaseInsensitiveContains(item.keyword) {
+                penaltyScore += 100
+            }
+        }
 
         for step in route.steps {
             let text = step.instructions + " " + (step.notice ?? "")
-            for item in barrierKeywords {
+            var matchedHazard = false
+
+            // 1. 检查是否包含纯车行道（高架、快速路、匝道、隧道、机动车道等）
+            for item in vehicleOnlyKeywords {
                 if text.localizedCaseInsensitiveContains(item.keyword) {
+                    // 特例排除：如果明确写着“人行道”或“辅路人行横道”，不误判为纯车行
+                    if text.contains("人行") || text.contains("步行") {
+                        continue
+                    }
+                    penaltyScore += 100
+                    matchedHazard = true
                     let stepCoords = extractCoordinates(from: step.polyline)
                     if let coord = stepCoords.first {
                         alerts.append(
                             RouteBarrierAlert(
                                 coordinate: coord,
                                 title: item.label,
-                                instruction: step.instructions.isEmpty ? "请注意此处可能有\(item.label)，可走附近平地斑马线绕行" : step.instructions
+                                instruction: step.instructions.isEmpty ? "注意：此处靠近\(item.label)，请走外侧人行步道" : step.instructions
                             )
                         )
                     }
                     break
                 }
             }
+
+            // 2. 检查是否包含垂直通行障碍（人行天桥、地下通道、台阶等）
+            if !matchedHazard {
+                for item in verticalBarrierKeywords {
+                    if text.localizedCaseInsensitiveContains(item.keyword) {
+                        penaltyScore += 60
+                        matchedHazard = true
+                        let stepCoords = extractCoordinates(from: step.polyline)
+                        if let coord = stepCoords.first {
+                            alerts.append(
+                                RouteBarrierAlert(
+                                    coordinate: coord,
+                                    title: item.label,
+                                    instruction: step.instructions.isEmpty ? "此处含\(item.label)，可走附近平地斑马线绕行" : step.instructions
+                                )
+                            )
+                        }
+                        break
+                    }
+                }
+            }
+
+            // 3. 统计双侧人行道/斑马线/步行友好街区正向得分
+            for friendly in sidewalkFriendlyKeywords {
+                if text.localizedCaseInsensitiveContains(friendly) {
+                    sidewalkBonus += 15
+                }
+            }
+            // 常规城市生活街道（包含“街”或“路”且无高架/快速路字样）通常两侧均设有人行道
+            if !matchedHazard && (text.contains("街") || text.contains("路")) {
+                sidewalkBonus += 5
+            }
         }
-        return alerts
+
+        return (alerts, penaltyScore, sidewalkBonus)
+    }
+
+    /// 当手绘锚点不幸刚好落在高架桥、车行隧道或主干道中央隔离带上时，生成向道路两侧垂直偏移 85 米的人行道候选锚点
+    private func generateSidewalkNudgeCandidates(
+        from start: CLLocationCoordinate2D,
+        target: CLLocationCoordinate2D,
+        offsetMeters: Double
+    ) -> [CLLocationCoordinate2D] {
+        let metersPerLat = 111132.0
+        let metersPerLon = 111319.5 * cos(target.latitude * .pi / 180.0)
+        guard metersPerLon > 1.0 else { return [] }
+
+        let dx = (target.longitude - start.longitude) * metersPerLon
+        let dy = (target.latitude - start.latitude) * metersPerLat
+        let len = sqrt(dx * dx + dy * dy)
+        guard len > 1.0 else { return [] }
+
+        // 垂直于行进方向的左右单位法向量
+        let nx = -dy / len
+        let ny = dx / len
+
+        let leftCoord = CLLocationCoordinate2D(
+            latitude: target.latitude + (ny * offsetMeters) / metersPerLat,
+            longitude: target.longitude + (nx * offsetMeters) / metersPerLon
+        )
+        let rightCoord = CLLocationCoordinate2D(
+            latitude: target.latitude - (ny * offsetMeters) / metersPerLat,
+            longitude: target.longitude - (nx * offsetMeters) / metersPerLon
+        )
+        return [leftCoord, rightCoord]
     }
 
     private func filterAlertsOnFinalRoute(
@@ -227,7 +406,6 @@ final class RouteSnapEngine: ObservableObject {
         var valid: [RouteBarrierAlert] = []
 
         for alert in alerts {
-            // 仅当该天桥/通道坐标距离最终保留的路线 <= 30 米，且不与已有提示点重复时才保留
             var isOnRoute = false
             for pt in routeCoords {
                 if distanceBetween(alert.coordinate, pt) <= 30.0 {
