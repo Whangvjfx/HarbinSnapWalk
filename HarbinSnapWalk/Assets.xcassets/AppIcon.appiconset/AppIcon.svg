@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- 极夜深邃黑曜石渐变背景 -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0A0E1A"/>
+      <stop offset="45%" stop-color="#070A12"/>
+      <stop offset="100%" stop-color="#04060A"/>
+    </linearGradient>
+
+    <!-- 顶层环境光感辉光 -->
+    <radialGradient id="ambientCyanGlow" cx="30%" cy="25%" r="65%">
+      <stop offset="0%" stop-color="#00F5D4" stop-opacity="0.18"/>
+      <stop offset="50%" stop-color="#00B4D8" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="ambientVioletGlow" cx="72%" cy="75%" r="60%">
+      <stop offset="0%" stop-color="#7928CA" stop-opacity="0.22"/>
+      <stop offset="50%" stop-color="#FF0080" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- 核心光带能量渐变：从电光青、天蓝、紫罗兰到高能玫红 -->
+    <linearGradient id="neonPathGrad" x1="15%" y1="20%" x2="85%" y2="85%">
+      <stop offset="0%" stop-color="#00F5D4"/>
+      <stop offset="28%" stop-color="#00B4D8"/>
+      <stop offset="62%" stop-color="#6366F1"/>
+      <stop offset="85%" stop-color="#8B5CF6"/>
+      <stop offset="100%" stop-color="#EC4899"/>
+    </linearGradient>
+
+    <!-- 辉光滤镜 -->
+    <filter id="softGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="38" result="blur1"/>
+      <feMerge>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="beaconGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="16" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- 微妙路网网格遮罩 -->
+    <linearGradient id="gridFade" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.03"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 1. 底层极简黑曜石背景 -->
+  <rect width="1024" height="1024" fill="url(#bgGrad)"/>
+  <rect width="1024" height="1024" fill="url(#ambientCyanGlow)"/>
+  <rect width="1024" height="1024" fill="url(#ambientVioletGlow)"/>
+
+  <!-- 2. 精致极简背景街区路网（高对比度下的细腻层次感） -->
+  <g stroke="url(#gridFade)" stroke-width="2" fill="none" opacity="0.65">
+    <!-- 同心城市环线 -->
+    <circle cx="512" cy="512" r="380" stroke-dasharray="8 16"/>
+    <circle cx="512" cy="512" r="260" stroke-dasharray="6 14"/>
+    <circle cx="512" cy="512" r="140" stroke-dasharray="4 12"/>
+
+    <!-- 正交街区微网格 (倾斜 15 度，赋予流动现代动感) -->
+    <g transform="rotate(-12 512 512)">
+      <line x1="160" y1="280" x2="864" y2="280"/>
+      <line x1="160" y1="512" x2="864" y2="512"/>
+      <line x1="160" y1="744" x2="864" y2="744"/>
+      <line x1="280" y1="160" x2="280" y2="864"/>
+      <line x1="512" y1="160" x2="512" y2="864"/>
+      <line x1="744" y1="160" x2="744" y2="864"/>
+    </g>
+  </g>
+
+  <!-- 3. 主角超级符号：无限延展、优美闭环的漫步轨迹（融合 S 构型与闭环回路） -->
+  <!-- 轨迹发光底层 (弥散霓虹光晕) -->
+  <path d="M 280 660 C 160 520, 200 320, 360 270 C 500 230, 520 420, 640 480 C 760 540, 840 440, 800 330 C 750 200, 560 240, 480 340 C 380 470, 240 680, 420 780 C 580 860, 780 780, 760 600 C 740 470, 600 480, 520 560 C 440 640, 360 760, 280 660 Z"
+        fill="none"
+        stroke="url(#neonPathGrad)"
+        stroke-width="96"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        opacity="0.32"
+        filter="url(#softGlow)"/>
+
+  <!-- 核心主光轨 (极具力量与流动感的实体高能光带) -->
+  <path d="M 280 660 C 160 520, 200 320, 360 270 C 500 230, 520 420, 640 480 C 760 540, 840 440, 800 330 C 750 200, 560 240, 480 340 C 380 470, 240 680, 420 780 C 580 860, 780 780, 760 600 C 740 470, 600 480, 520 560 C 440 640, 360 760, 280 660 Z"
+        fill="none"
+        stroke="url(#neonPathGrad)"
+        stroke-width="58"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+
+  <!-- 光轨内部高光流动核心骨干 (增强 3D 浮雕立体感与玻璃质感) -->
+  <path d="M 280 660 C 160 520, 200 320, 360 270 C 500 230, 520 420, 640 480 C 760 540, 840 440, 800 330 C 750 200, 560 240, 480 340 C 380 470, 240 680, 420 780 C 580 860, 780 780, 760 600 C 740 470, 600 480, 520 560 C 440 640, 360 760, 280 660 Z"
+        fill="none"
+        stroke="#FFFFFF"
+        stroke-width="12"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        opacity="0.85"/>
+
+  <!-- 沿路径点缀的科技感打卡脉冲微点 (虚线光链) -->
+  <path d="M 280 660 C 160 520, 200 320, 360 270 C 500 230, 520 420, 640 480 C 760 540, 840 440, 800 330 C 750 200, 560 240, 480 340 C 380 470, 240 680, 420 780 C 580 860, 780 780, 760 600 C 740 470, 600 480, 520 560 C 440 640, 360 760, 280 660 Z"
+        fill="none"
+        stroke="#00F5D4"
+        stroke-width="6"
+        stroke-dasharray="16 36"
+        opacity="0.9"/>
+
+  <!-- 4. 高亮行进灯塔与定位导航核心 (纯白高反差 Walker Beacon) -->
+  <!-- 左上弧顶关键转折点：纯白光芒导航箭头标 -->
+  <g transform="translate(360, 270)" filter="url(#beaconGlow)">
+    <circle r="46" fill="#00F5D4" opacity="0.35"/>
+    <circle r="30" fill="#FFFFFF"/>
+    <!-- 极简高对比度行进箭头 (深色微型箭羽) -->
+    <path d="M -8 10 L 0 -10 L 8 10 L 0 5 Z" fill="#0A0E1A"/>
+  </g>
+
+  <!-- 右下转折锚点：高能霓虹脉冲星 -->
+  <g transform="translate(760, 600)">
+    <circle r="32" fill="#EC4899" opacity="0.4" filter="url(#beaconGlow)"/>
+    <circle r="20" fill="#FFFFFF"/>
+    <circle r="9" fill="#EC4899"/>
+  </g>
+
+  <!-- 中间交叉吸附路口：灵动微型光斑 -->
+  <circle cx="520" cy="560" r="14" fill="#00F5D4" filter="url(#beaconGlow)"/>
+  <circle cx="520" cy="560" r="7" fill="#FFFFFF"/>
+
+  <!-- 5. 顶层超精致微边框光泽 (Apple 标志性内边缘高光) -->
+  <rect x="2" y="2" width="1020" height="1020" fill="none" stroke="#FFFFFF" stroke-width="2.5" opacity="0.12"/>
+</svg>
