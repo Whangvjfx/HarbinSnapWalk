@@ -13,6 +13,7 @@ struct MainMapView: View {
     @StateObject private var locationManager = LocationManager()
     @StateObject private var userProfile = UserProfileModel()
     @StateObject private var recordStore = ActivityRecordStore()
+    @StateObject private var savedRouteStore = SavedRouteStore()
     @StateObject private var trackingManager = RouteTrackingManager()
 
     @State private var selectedCity: SupportedCity = .harbin
@@ -26,6 +27,8 @@ struct MainMapView: View {
     @State private var showSearchSheet = false
     @State private var showProfileSheet = false
     @State private var showHistorySheet = false
+    @State private var showSavedRoutesSheet = false
+    @State private var showSaveRouteDialog = false
 
     @State private var cameraPosition: MapCameraPosition = .region(
         MKCoordinateRegion(
@@ -145,11 +148,31 @@ struct MainMapView: View {
                 locateCoordinate(coord, delta: 0.016)
             }
         }
+        .sheet(isPresented: $showSavedRoutesSheet) {
+            SavedRoutesView(store: savedRouteStore) { saved in
+                loadSavedRoute(saved)
+            }
+        }
         .sheet(isPresented: $showProfileSheet) {
             UserProfileView(profile: userProfile)
         }
         .sheet(isPresented: $showHistorySheet) {
             HistoryRecordsView(store: recordStore)
+        }
+        .fullScreenCover(isPresented: $showSaveRouteDialog) {
+            if let res = snapEngine.currentResult {
+                let defaultName = "\(selectedCity.rawValue) \(res.distanceKmFormatted) 路线"
+                SaveRouteDialogView(isPresented: $showSaveRouteDialog, defaultName: defaultName) { name in
+                    savedRouteStore.saveRoute(
+                        name: name,
+                        result: res,
+                        cityName: selectedCity.rawValue,
+                        weightKg: userProfile.weightKg
+                    )
+                    snapEngine.statusMessage = "🌟 路线「\(name)」已成功收藏！"
+                }
+                .background(ClearBackgroundView())
+            }
         }
         .fullScreenCover(isPresented: $trackingManager.showWorkoutSummary) {
             if let record = trackingManager.lastCompletedRecord {
@@ -164,7 +187,6 @@ struct MainMapView: View {
             pedometer.refreshTodaySteps()
         }
         .onChange(of: selectedCity) { _, newCity in
-            // 核心保证：切换城市时，地图立即丝滑飞至该城市第一默认位置！
             locateCoordinate(newCity.defaultSpot.coordinate, delta: 0.020)
         }
         .onChange(of: locationManager.userLocation) { _, newLoc in
@@ -178,9 +200,9 @@ struct MainMapView: View {
         }
     }
 
-    // MARK: - 顶部精致磨砂悬浮导航栏 (带一键秒级切城 Menu)
+    // MARK: - 顶部精致磨砂悬浮导航栏 (带收藏路线入口)
     private var topFloatingNavBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             // 城市快速切换 Menu：点击即切换并立即飞往该城市默认位置
             Menu {
                 ForEach(SupportedCity.allCases) { city in
@@ -201,17 +223,17 @@ struct MainMapView: View {
                     Label("浏览城市更多精选地标...", systemImage: "list.bullet.circle")
                 }
             } label: {
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     Image(systemName: "location.north.circle.fill")
                         .font(.subheadline)
                         .foregroundStyle(.blue)
                     Text(selectedCity.rawValue)
                         .font(.system(.subheadline, design: .rounded).bold())
                     Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 14)
+                .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .background(
                     Capsule()
@@ -238,6 +260,11 @@ struct MainMapView: View {
                 showSearchSheet = true
             }
 
+            // 收藏路线按钮 (专属管理已收藏路线)
+            frostedNavIconButton(icon: "bookmark.fill") {
+                showSavedRoutesSheet = true
+            }
+
             // 历史归档按钮
             frostedNavIconButton(icon: "clock.arrow.circlepath") {
                 showHistorySheet = true
@@ -250,7 +277,7 @@ struct MainMapView: View {
         }
     }
 
-    // MARK: - 全新极简 Apple 风格磨砂玻璃底部卡片
+    // MARK: - 全新极简 Apple 风格磨砂玻璃底部卡片 (带收藏与命名触发)
     private var redesignedBottomCard: some View {
         VStack(spacing: 14) {
             // 1. 顶部状态与健康建议微标签
@@ -359,18 +386,30 @@ struct MainMapView: View {
                 }
             }
 
-            // 4. 精炼按钮栏（消除凌乱堆砌，主次分明）
-            HStack(spacing: 12) {
+            // 4. 精炼按钮栏（包含一键收藏与命名按钮）
+            HStack(spacing: 10) {
                 if snapEngine.currentResult != nil {
                     // 清空小圆纽
                     Button(action: { snapEngine.clear() }) {
                         Image(systemName: "trash")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(.red)
-                            .frame(width: 48, height: 48)
+                            .frame(width: 46, height: 46)
                             .background(
                                 Circle()
                                     .fill(Color.red.opacity(0.1))
+                            )
+                    }
+
+                    // 收藏此路线按钮（弹出自定义命名对话框）
+                    Button(action: { showSaveRouteDialog = true }) {
+                        Image(systemName: "bookmark")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(.orange)
+                            .frame(width: 46, height: 46)
+                            .background(
+                                Circle()
+                                    .fill(Color.orange.opacity(0.12))
                             )
                     }
 
@@ -409,7 +448,7 @@ struct MainMapView: View {
                         Image(systemName: "pencil.tip.crop.circle")
                             .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(.blue)
-                            .frame(width: 48, height: 48)
+                            .frame(width: 46, height: 46)
                             .background(
                                 Circle()
                                     .fill(Color.blue.opacity(0.12))
@@ -447,7 +486,7 @@ struct MainMapView: View {
                     Image(systemName: trackingIconName)
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(trackingState != .free ? .white : .primary)
-                        .frame(width: 48, height: 48)
+                        .frame(width: 46, height: 46)
                         .background(
                             Circle()
                                 .fill(trackingState != .free ? Color.blue : Color.primary.opacity(0.08))
@@ -620,6 +659,44 @@ struct MainMapView: View {
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 32)
+    }
+
+    // MARK: - 加载收藏路线并在地图取景
+    private func loadSavedRoute(_ saved: SavedRoute) {
+        let result = saved.toSnappedRouteResult(strideLength: userProfile.effectiveStrideLength)
+        snapEngine.currentResult = result
+        snapEngine.statusMessage = "已调出收藏路线「\(saved.name)」"
+
+        // 自动适配城市标签
+        if let matchCity = SupportedCity.allCases.first(where: { $0.rawValue == saved.cityName }) {
+            selectedCity = matchCity
+        }
+
+        // 镜头自动框选整条路线
+        let coords = saved.coordinates
+        guard !coords.isEmpty else { return }
+        var minLat = coords[0].latitude
+        var maxLat = coords[0].latitude
+        var minLon = coords[0].longitude
+        var maxLon = coords[0].longitude
+
+        for c in coords {
+            minLat = min(minLat, c.latitude)
+            maxLat = max(maxLat, c.latitude)
+            minLon = min(minLon, c.longitude)
+            maxLon = max(maxLon, c.longitude)
+        }
+
+        let center = CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2.0, longitude: (minLon + maxLon) / 2.0)
+        let span = MKCoordinateSpan(
+            latitudeDelta: max(0.012, (maxLat - minLat) * 1.45),
+            longitudeDelta: max(0.012, (maxLon - minLon) * 1.45)
+        )
+        trackingState = .free
+        locationManager.setHeadingTracking(enabled: false)
+        withAnimation {
+            cameraPosition = .region(MKCoordinateRegion(center: center, span: span))
+        }
     }
 
     // MARK: - 手势绘图结束处理
