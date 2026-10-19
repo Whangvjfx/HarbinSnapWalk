@@ -74,6 +74,7 @@ final class RouteSnapEngine: ObservableObject {
     @discardableResult
     func snapUserSketchToRoads(
         rawCoordinates: [CLLocationCoordinate2D],
+        startCoordinate: CLLocationCoordinate2D? = nil,
         strideLength: Double
     ) async -> SnappedRouteResult? {
         guard rawCoordinates.count >= 2 else {
@@ -84,7 +85,7 @@ final class RouteSnapEngine: ObservableObject {
         snapGeneration += 1
         let myGeneration = snapGeneration
         self.isSnapping = true
-        self.statusMessage = "正在优选双侧人行道平路并避开车行干道..."
+        self.statusMessage = "正在从当前定位出发，优选双侧人行道平路..."
         defer {
             if myGeneration == snapGeneration {
                 self.isSnapping = false
@@ -105,8 +106,17 @@ final class RouteSnapEngine: ObservableObject {
         let loopTrimmed = isLoopIntent ? trimSketchLoopOvershoot(cleaned) : cleaned
         var anchors = downsampleCoordinatesAdaptively(loopTrimmed, isLoop: isLoopIntent)
 
-        if isLoopIntent, let first = anchors.first {
-            anchors.append(first)
+        // 核心要求：所有轨迹的起点都必须是当前定位！
+        let userOrigin = startCoordinate ?? rawCoordinates.first!
+        if let first = anchors.first, distanceBetween(userOrigin, first) <= 120.0 {
+            anchors[0] = userOrigin
+        } else {
+            anchors.insert(userOrigin, at: 0)
+        }
+
+        if isLoopIntent {
+            // 环形路线终点闭合回当前定位
+            anchors.append(userOrigin)
         }
 
         guard anchors.count >= 2 else {
@@ -115,8 +125,6 @@ final class RouteSnapEngine: ObservableObject {
         }
 
         // 3. 串联发起步行路径吸附
-        // 单段失败（如锚点落在河面/封闭园区内无路可达、或请求过于频繁被限流）不再导致整条路线失败：
-        // 限流时等待后重试一次；仍失败则跳过该中间锚点，从上一个成功点直接连到下一个锚点
         var rawLegs: [[CLLocationCoordinate2D]] = []
         var rawTravelTimeSeconds: TimeInterval = 0.0
         var rawTotalDistance: Double = 0.0
@@ -135,7 +143,6 @@ final class RouteSnapEngine: ObservableObject {
 
             if selection == nil {
                 if isIntermediateEnd {
-                    // 跳过这个无法到达的中间锚点
                     skippedAnchors += 1
                     i += 1
                     continue
@@ -188,15 +195,10 @@ final class RouteSnapEngine: ObservableObject {
         let stitchedDense = stitchLegsEliminatingJunctionSpurs(rawLegs)
         var spurFreeDense = eradicateAllSpursAndHairpins(stitchedDense, isLoop: isLoopIntent)
 
-        // 安全阀：若裁剪后长度不足原路线 30%，说明用户本意可能就是「沿同一条路走出去再走回来」，此时只保留接缝级裁剪，避免路线被裁没
+        // 安全阀：若裁剪后长度不足原路线 30%，保留接缝级裁剪
         let stitchedLen = calculateTotalDistance(stitchedDense)
         if stitchedLen > 0, calculateTotalDistance(spurFreeDense) < stitchedLen * 0.30 {
             spurFreeDense = stitchedDense
-        }
-
-        // 环形路线：裁掉起终点处「从起点走出去、最后又原路走回起点」的重叠尾巴，让起点落在真正的路口
-        if isLoopIntent {
-            spurFreeDense = trimLoopStartStub(spurFreeDense)
         }
 
         let cleanedCoords = simplifyCollinearPoints(spurFreeDense, minStep: 5.5)
@@ -206,17 +208,28 @@ final class RouteSnapEngine: ObservableObject {
             return nil
         }
 
-        let activeAlerts = filterAlertsOnFinalRoute(alerts: candidateBarrierAlerts, routeCoords: cleanedCoords)
+        // 确保折线轨迹严密连接用户当前定位
+        var finalPathCoords = cleanedCoords
+        if distanceBetween(finalPathCoords.first!, userOrigin) > 3.0 {
+            finalPathCoords.insert(userOrigin, at: 0)
+        }
+        if isLoopIntent && distanceBetween(finalPathCoords.last!, userOrigin) > 3.0 {
+            finalPathCoords.append(userOrigin)
+        }
 
-        let finalDistance = calculateTotalDistance(cleanedCoords)
+        let activeAlerts = filterAlertsOnFinalRoute(alerts: candidateBarrierAlerts, routeCoords: finalPathCoords)
+
+        let finalDistance = calculateTotalDistance(finalPathCoords)
         let paceRatio = rawTotalDistance > 10.0 ? (finalDistance / rawTotalDistance) : 1.0
         let adjustedSeconds = max(60.0, rawTravelTimeSeconds * min(1.0, max(0.3, paceRatio)))
-        let finalPolyline = MKPolyline(coordinates: cleanedCoords, count: cleanedCoords.count)
+        let finalPolyline = MKPolyline(coordinates: finalPathCoords, count: finalPathCoords.count)
 
-        // 起终点标记使用真正贴在道路上的坐标（而不是手指画在楼房/园区里的原始点）
+        // 起终点标记严格使用用户当前定位
         var displayAnchors = anchors
-        displayAnchors[0] = cleanedCoords.first!
-        displayAnchors[displayAnchors.count - 1] = isLoopIntent ? cleanedCoords.first! : cleanedCoords.last!
+        displayAnchors[0] = userOrigin
+        if isLoopIntent {
+            displayAnchors[displayAnchors.count - 1] = userOrigin
+        }
 
         let result = SnappedRouteResult(
             polylines: [finalPolyline],
@@ -233,11 +246,11 @@ final class RouteSnapEngine: ObservableObject {
         let routeTypeLabel = isLoopIntent ? "环形闭环" : "单向路线"
         let skipNote = skippedAnchors > 0 ? "（\(skippedAnchors) 处无路可达已绕开）" : ""
         if !activeAlerts.isEmpty {
-            self.statusMessage = "⚠️ \(routeTypeLabel)：含 \(activeAlerts.count) 处天桥/车行段，地图已标橙色\(skipNote)"
+            self.statusMessage = "⚠️ \(routeTypeLabel)：起点已锁定当前定位，含 \(activeAlerts.count) 处天桥/车行段\(skipNote)"
         } else if totalAvoidedHazards > 0 {
-            self.statusMessage = "✅ \(routeTypeLabel)：已避开 \(totalAvoidedHazards) 处车行道/天桥\(skipNote)"
+            self.statusMessage = "✅ \(routeTypeLabel)：起点已锁定当前定位，已避开 \(totalAvoidedHazards) 处车行道/天桥\(skipNote)"
         } else {
-            self.statusMessage = "✅ \(routeTypeLabel)：未发现天桥/车行高架提示\(skipNote)"
+            self.statusMessage = "✅ \(routeTypeLabel)：起点已锁定当前定位，全程双侧人行道平路\(skipNote)"
         }
         return result
     }
@@ -266,45 +279,6 @@ final class RouteSnapEngine: ObservableObject {
             }
         }
         return nil
-    }
-
-    /// 环形路线起终点重叠尾巴裁剪：从首尾两端同时向内走，只要两端仍在同一条路上（≤10 米）就继续收缩
-    private func trimLoopStartStub(_ coords: [CLLocationCoordinate2D]) -> [CLLocationCoordinate2D] {
-        guard coords.count > 20 else { return coords }
-        let ref = coords[0]
-        let pts = toPlanarPoints(coords, reference: ref)
-        let total = calculateTotalDistance(coords)
-        var head = 0
-        var tail = pts.count - 1
-        var trimmedLen = 0.0
-
-        while head + 1 < tail - 1 {
-            let nextHead = head + 1
-            var bestTail = -1
-            var bestDSq = 100.0 // 10 米
-            let low = max(nextHead + 1, tail - 6)
-            if low > tail { break }
-            for t in low...tail {
-                let dx = pts[nextHead].x - pts[t].x
-                let dy = pts[nextHead].y - pts[t].y
-                let dSq = dx * dx + dy * dy
-                if dSq <= bestDSq {
-                    bestDSq = dSq
-                    bestTail = t
-                }
-            }
-            guard bestTail >= 0 else { break }
-            let step = distanceBetween(coords[head], coords[nextHead])
-            trimmedLen += step * 2
-            if trimmedLen > total * 0.30 { break }
-            head = nextHead
-            tail = bestTail
-        }
-
-        guard head >= 3, tail > head + 10 else { return coords }
-        var result = Array(coords[head...tail])
-        result[result.count - 1] = result[0]
-        return result
     }
 
     // MARK: - 行人步道优选与车行道/天桥规避引擎

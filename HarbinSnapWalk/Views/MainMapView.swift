@@ -728,12 +728,13 @@ struct MainMapView: View {
 
         guard !coords.isEmpty else { return }
 
+        // 核心：所有轨迹起点必须锚定在用户当前定位（若无定位则以城市第一地标为准）
+        let userPos = locationManager.userLocation ?? selectedCity.defaultSpot.coordinate
+
         Task {
             if isRevisingRoute {
                 var finalPoints = coords
-                if let userLoc = locationManager.userLocation {
-                    finalPoints.insert(userLoc, at: 0)
-                }
+                finalPoints.insert(userPos, at: 0)
 
                 if let initialStart = trackingManager.workoutInitialCoordinate,
                    let lastPt = finalPoints.last {
@@ -746,6 +747,7 @@ struct MainMapView: View {
 
                 let newRoute = await snapEngine.snapUserSketchToRoads(
                     rawCoordinates: finalPoints,
+                    startCoordinate: userPos,
                     strideLength: userProfile.effectiveStrideLength
                 )
 
@@ -756,6 +758,7 @@ struct MainMapView: View {
             } else {
                 await snapEngine.snapUserSketchToRoads(
                     rawCoordinates: coords,
+                    startCoordinate: userPos,
                     strideLength: userProfile.effectiveStrideLength
                 )
             }
