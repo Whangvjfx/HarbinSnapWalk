@@ -5,6 +5,67 @@ import Combine
 import UIKit
 import UserNotifications
 
+/// 运动暂停状态持久化容器（供后台挂起、杀死或关闭 App 后恢复使用）
+struct PausedWorkoutSession: Codable {
+    let cityName: String
+    let elapsedSeconds: TimeInterval
+    let completedDistanceMeters: Double
+    let currentCalories: Double
+    let progressRate: Double
+    let nextCheckpointIndex: Int
+    let skippedCheckpointCount: Int
+    let hasAcquiredRoute: Bool
+    let pausedLatitude: Double?
+    let pausedLongitude: Double?
+    let pausedAt: Date
+    let startDate: Date?
+
+    // 路线几何数据
+    let routeCoordinatesData: [[Double]] // [[lat, lon], ...]
+    let routeDistanceMeters: Double
+    let routeEstimatedTravelSeconds: TimeInterval
+    let routeStrideLength: Double
+    let routeIsLoop: Bool
+    let routeAnchorWaypointsData: [[Double]]
+
+    // 障碍提示点
+    let barrierAlertsData: [PausedBarrierAlert]
+
+    func restoreSnappedRoute() -> SnappedRouteResult {
+        let coords = routeCoordinatesData.map { CLLocationCoordinate2D(latitude: $0[0], longitude: $0[1]) }
+        let anchors = routeAnchorWaypointsData.map { CLLocationCoordinate2D(latitude: $0[0], longitude: $0[1]) }
+        let polyline = MKPolyline(coordinates: coords, count: coords.count)
+        let alerts = barrierAlertsData.map {
+            RouteBarrierAlert(
+                coordinate: CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude),
+                title: $0.title,
+                instruction: $0.instruction
+            )
+        }
+        return SnappedRouteResult(
+            polylines: [polyline],
+            anchorWaypoints: anchors.isEmpty ? (coords.isEmpty ? [] : [coords.first!, coords.last!]) : anchors,
+            totalDistanceMeters: routeDistanceMeters,
+            estimatedTravelSeconds: routeEstimatedTravelSeconds,
+            strideLength: routeStrideLength,
+            shape: routeIsLoop ? .loop : .open,
+            barrierAlerts: alerts
+        )
+    }
+
+    var pausedCoordinate: CLLocationCoordinate2D? {
+        guard let lat = pausedLatitude, let lon = pausedLongitude else { return nil }
+        return CLLocationCoordinate2D(latitude: lat, longitude: lon)
+    }
+}
+
+struct PausedBarrierAlert: Codable {
+    let latitude: Double
+    let longitude: Double
+    let title: String
+    let instruction: String
+}
+
 @MainActor
 final class RouteTrackingManager: ObservableObject {
     @Published var isTracking: Bool = false
@@ -18,18 +79,25 @@ final class RouteTrackingManager: ObservableObject {
     @Published var showWorkoutSummary: Bool = false
     @Published var lastCompletedRecord: ActivityRecord? = nil
 
-    // MARK: - 判定参数（兼顾宽容与防作弊）
-    /// 检查点到达半径（米）：覆盖城市 GPS 常见 10~30 米漂移，以及马路对侧人行道
-    private let reachRadius: Double = 40.0
-    /// 允许一次性向前跳过的检查点数量（4 × 60 米 ≈ 240 米），用于绕开天桥、施工围挡
+    // 断点续走与检查点容错增强状态
+    @Published var lastPausedCoordinate: CLLocationCoordinate2D? = nil
+    @Published var hasRestoredFromPause: Bool = false
+    @Published var activeCheckpointCoordinate: CLLocationCoordinate2D? = nil
+    @Published var currentCheckpointIndex: Int = 0
+    @Published var totalCheckpointCount: Int = 0
+
+    // MARK: - 判定参数（宽容且鲁棒的检查点容错机制）
+    /// 检查点到达判定半径：放宽至 55 米，覆盖多车道马路对侧、树荫遮挡及偶发 GPS 漂移
+    private let reachRadius: Double = 55.0
+    /// 允许向前跳过的检查点数量（4 × 60 米 ≈ 240 米），用于绕开施工围挡、天桥
     private let maxSkipAhead: Int = 4
-    /// 全程累计跳过的检查点不得超过 25%，否则不判定为自动完赛（防止抄近道）
-    private let maxSkipRatio: Double = 0.25
-    /// 实际有效步行里程至少达到路线长度的 60% 才判定完赛（防止 GPS 跳点/瞬移作弊）
-    private let minDistanceRatio: Double = 0.60
-    /// 定位精度差于 50 米的点直接丢弃，避免室内/高楼间漂移干扰
-    private let maxAcceptableAccuracy: Double = 50.0
-    /// 步行速度上限 18 km/h，连续 2 次超过判定为乘车
+    /// 全程累计跳过的检查点上限比例
+    private let maxSkipRatio: Double = 0.35
+    /// 有效步行里程判定比例
+    private let minDistanceRatio: Double = 0.50
+    /// 定位精度过滤上限（超 60 米视为严重漂移）
+    private let maxAcceptableAccuracy: Double = 60.0
+    /// 步行速度上限（18 km/h）
     private let vehicleSpeedMps: Double = 5.0
 
     // 活跃路线与检查点
@@ -56,6 +124,77 @@ final class RouteTrackingManager: ObservableObject {
     private var cityName: String = "哈尔滨市"
     private var weightProvider: UserProfileModel?
 
+    // 后台任务保活与断点持久化
+    private var bgTaskId: UIBackgroundTaskIdentifier = .invalid
+    private let persistenceFileName = "paused_workout_session.json"
+    private var sessionPersistenceURL: URL {
+        let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+        return paths[0].appendingPathComponent(persistenceFileName)
+    }
+
+    init() {
+        setupLifecycleObservers()
+    }
+
+    // MARK: - 生命周期与后台运行保活处理
+    private func setupLifecycleObservers() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleAppDidEnterBackground()
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleAppWillEnterForeground()
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleAppWillTerminate()
+        }
+    }
+
+    private func handleAppDidEnterBackground() {
+        guard isTracking else { return }
+        // 用户切出到微信、相机、音乐等其他应用时：自动把当前最新状态持久化到磁盘
+        saveCurrentStateToDisk(currentLocation: lastAcceptedLocation?.coordinate ?? initialStartCoordinate)
+
+        // 申请后台任务，保证切出瞬间未完成的运算与数据落地不受阻断
+        bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "HarbinSnapWalkBackgroundTracker") { [weak self] in
+            self?.endBackgroundTask()
+        }
+    }
+
+    private func handleAppWillEnterForeground() {
+        endBackgroundTask()
+        if isTracking {
+            refreshElapsed()
+        }
+    }
+
+    private func handleAppWillTerminate() {
+        guard isTracking else { return }
+        saveCurrentStateToDisk(currentLocation: lastAcceptedLocation?.coordinate ?? initialStartCoordinate)
+    }
+
+    private func endBackgroundTask() {
+        if bgTaskId != .invalid {
+            UIApplication.shared.endBackgroundTask(bgTaskId)
+            bgTaskId = .invalid
+        }
+    }
+
+    // MARK: - 行程生命周期控制
+
     func startWorkout(
         route: SnappedRouteResult,
         userProfile: UserProfileModel,
@@ -71,6 +210,8 @@ final class RouteTrackingManager: ObservableObject {
         self.offRouteNotice = nil
         self.isTracking = true
         self.isPaused = false
+        self.hasRestoredFromPause = false
+        self.lastPausedCoordinate = nil
         self.lastAcceptedLocation = nil
         self.consecutiveFastFixes = 0
         self.isCurrentlyOffRoute = false
@@ -85,12 +226,21 @@ final class RouteTrackingManager: ObservableObject {
         loadRoute(route)
         requestNotificationPermissionIfNeeded()
         startTimer(userProfile: userProfile)
+        saveCurrentStateToDisk(currentLocation: initialStartCoordinate)
     }
 
-    func pauseWorkout() {
+    func pauseWorkout(currentLocation: CLLocationCoordinate2D? = nil) {
         guard !isPaused else { return }
         self.isPaused = true
         self.pauseBeganAt = Date()
+        let loc = currentLocation ?? lastAcceptedLocation?.coordinate ?? initialStartCoordinate
+        self.lastPausedCoordinate = loc
+        saveCurrentStateToDisk(currentLocation: loc)
+        postLocalNotification(
+            id: "workout-paused",
+            title: "⏸️ 行程已暂停",
+            body: "已记录当前暂停位置。即使关闭软件，重新打开也可继续进行。"
+        )
     }
 
     func resumeWorkout() {
@@ -99,9 +249,12 @@ final class RouteTrackingManager: ObservableObject {
             pausedAccumulated += Date().timeIntervalSince(began)
         }
         pauseBeganAt = nil
-        // 恢复后重新取点，暂停期间移动的距离不计入
         lastAcceptedLocation = nil
         self.isPaused = false
+        self.hasRestoredFromPause = false
+        self.lastPausedCoordinate = nil
+        saveCurrentStateToDisk(currentLocation: lastAcceptedLocation?.coordinate)
+        self.offRouteNotice = "行程已继续！"
     }
 
     func stopWorkout(userProfile: UserProfileModel, completedNaturally: Bool, recordStore: ActivityRecordStore) {
@@ -115,6 +268,7 @@ final class RouteTrackingManager: ObservableObject {
         let finalCalories = userProfile.calculateCalories(durationSeconds: movingSeconds, speedKmH: avgSpeed)
         let steps = Int(round(completedDistanceMeters / userProfile.effectiveStrideLength))
 
+        // 最终统计里程严格按实际检测到的距离记录
         let record = ActivityRecord(
             id: UUID(),
             date: Date(),
@@ -134,7 +288,10 @@ final class RouteTrackingManager: ObservableObject {
 
         self.isTracking = false
         self.isPaused = false
+        self.hasRestoredFromPause = false
+        self.lastPausedCoordinate = nil
         self.offRouteNotice = nil
+        clearPausedState()
 
         if completedNaturally {
             postLocalNotification(
@@ -145,7 +302,140 @@ final class RouteTrackingManager: ObservableObject {
         }
     }
 
-    /// GPS 定位更新：精度过滤、乘车识别、顺序检查点推进（允许小范围绕障）、自动完赛
+    // MARK: - 容错机制：用户手动强制确认已完成当前段/检查点
+    func manuallyConfirmCurrentCheckpoint(userProfile: UserProfileModel, recordStore: ActivityRecordStore) {
+        guard isTracking, !checkpoints.isEmpty else { return }
+
+        if !hasAcquiredRoute {
+            hasAcquiredRoute = true
+            nextCheckpointIndex = 1
+            self.offRouteNotice = "✔️ 已手动确认开始并接入路线"
+        } else if nextCheckpointIndex < checkpoints.count {
+            nextCheckpointIndex += 1
+            let remaining = max(0, checkpoints.count - nextCheckpointIndex)
+            if remaining == 0 {
+                self.offRouteNotice = "🎉 已到达终点！"
+                stopWorkout(userProfile: userProfile, completedNaturally: true, recordStore: recordStore)
+                return
+            } else {
+                self.offRouteNotice = "✔️ 已确认通过当前段 (剩余 \(remaining) 个检查点)"
+            }
+        } else {
+            stopWorkout(userProfile: userProfile, completedNaturally: true, recordStore: recordStore)
+            return
+        }
+
+        updateCheckpointState()
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        saveCurrentStateToDisk(currentLocation: lastAcceptedLocation?.coordinate)
+    }
+
+    // MARK: - 暂停状态持久化与断点续走恢复
+    func saveCurrentStateToDisk(currentLocation: CLLocationCoordinate2D? = nil) {
+        guard let route = activeRoute else { return }
+        let coords = route.allRouteCoordinates
+        let anchors = route.anchorWaypoints
+        let loc = currentLocation ?? lastAcceptedLocation?.coordinate ?? initialStartCoordinate
+
+        let alertsData = route.barrierAlerts.map {
+            PausedBarrierAlert(
+                latitude: $0.coordinate.latitude,
+                longitude: $0.coordinate.longitude,
+                title: $0.title,
+                instruction: $0.instruction
+            )
+        }
+
+        let session = PausedWorkoutSession(
+            cityName: cityName,
+            elapsedSeconds: elapsedSeconds,
+            completedDistanceMeters: completedDistanceMeters,
+            currentCalories: currentCalories,
+            progressRate: progressRate,
+            nextCheckpointIndex: nextCheckpointIndex,
+            skippedCheckpointCount: skippedCheckpointCount,
+            hasAcquiredRoute: hasAcquiredRoute,
+            pausedLatitude: loc?.latitude,
+            pausedLongitude: loc?.longitude,
+            pausedAt: Date(),
+            startDate: startDate,
+            routeCoordinatesData: coords.map { [$0.latitude, $0.longitude] },
+            routeDistanceMeters: route.totalDistanceMeters,
+            routeEstimatedTravelSeconds: route.estimatedTravelSeconds,
+            routeStrideLength: route.strideLength,
+            routeIsLoop: route.shape == .loop,
+            routeAnchorWaypointsData: anchors.map { [$0.latitude, $0.longitude] },
+            barrierAlertsData: alertsData
+        )
+
+        do {
+            let data = try JSONEncoder().encode(session)
+            try data.write(to: sessionPersistenceURL, options: .atomic)
+        } catch {
+            print("保存暂停行程失败: \(error)")
+        }
+    }
+
+    func checkAndRestorePausedWorkout(userProfile: UserProfileModel) -> Bool {
+        guard FileManager.default.fileExists(atPath: sessionPersistenceURL.path) else { return false }
+        do {
+            let data = try Data(contentsOf: sessionPersistenceURL)
+            let session = try JSONDecoder().decode(PausedWorkoutSession.self, from: data)
+            let restoredRoute = session.restoreSnappedRoute()
+
+            self.cityName = session.cityName
+            self.activeRoute = restoredRoute
+            self.routeCoords = restoredRoute.allRouteCoordinates
+            self.routeLengthMeters = restoredRoute.totalDistanceMeters
+            self.checkpoints = extractCheckpoints(from: routeCoords, stepMeters: 60.0)
+            self.nextCheckpointIndex = session.nextCheckpointIndex
+            self.skippedCheckpointCount = session.skippedCheckpointCount
+            self.hasAcquiredRoute = session.hasAcquiredRoute
+            self.progressRate = session.progressRate
+
+            self.elapsedSeconds = session.elapsedSeconds
+            self.completedDistanceMeters = session.completedDistanceMeters
+            self.currentCalories = session.currentCalories
+            self.startDate = session.startDate ?? session.pausedAt
+            self.pausedAccumulated = 0
+            self.pauseBeganAt = Date()
+            self.weightProvider = userProfile
+            self.initialStartCoordinate = session.pausedCoordinate ?? restoredRoute.startCoordinate
+            self.lastPausedCoordinate = session.pausedCoordinate
+
+            self.isTracking = true
+            self.isPaused = true
+            self.hasRestoredFromPause = true
+            self.offRouteNotice = "已恢复上次暂停的行程，点击「继续运动」即可继续！"
+            updateCheckpointState()
+            return true
+        } catch {
+            print("恢复暂停行程异常: \(error)")
+            clearPausedState()
+            return false
+        }
+    }
+
+    func discardRestoredWorkout() {
+        clearPausedState()
+        timer?.cancel()
+        timer = nil
+        self.isTracking = false
+        self.isPaused = false
+        self.hasRestoredFromPause = false
+        self.lastPausedCoordinate = nil
+        self.activeRoute = nil
+        self.offRouteNotice = nil
+        updateCheckpointState()
+    }
+
+    func clearPausedState() {
+        self.lastPausedCoordinate = nil
+        self.hasRestoredFromPause = false
+        try? FileManager.default.removeItem(at: sessionPersistenceURL)
+    }
+
+    // MARK: - GPS 定位更新（真实距离累加与检查点自动推进）
     func processLocation(
         _ location: CLLocation,
         userProfile: UserProfileModel,
@@ -160,7 +450,7 @@ final class RouteTrackingManager: ObservableObject {
         }
         let coord = location.coordinate
 
-        // 2. 速度计算（优先使用系统测速，缺失时按两点间距离/时间估算）
+        // 2. 速度计算
         var segDist: Double = 0
         var dt: TimeInterval = 0
         if let last = lastAcceptedLocation {
@@ -171,7 +461,7 @@ final class RouteTrackingManager: ObservableObject {
         let speedMps = location.speed >= 0 ? location.speed : derivedSpeed
         self.currentSpeedKmH = max(0, speedMps * 3.6)
 
-        // 3. 乘车识别：连续 2 次超过 18 km/h
+        // 3. 乘车识别
         if speedMps > vehicleSpeedMps && derivedSpeed > vehicleSpeedMps * 0.8 {
             consecutiveFastFixes += 1
         } else {
@@ -183,30 +473,31 @@ final class RouteTrackingManager: ObservableObject {
             return
         }
 
-        // 4. 里程累计（按偏离程度给予全额/折算/不计）
+        // 4. 里程累计：严格按真实检测到的物理距离计算
         let distanceToRoute = distanceFromPointToPolyline(coord, routeCoords)
         if lastAcceptedLocation != nil, segDist < 80.0 {
-            if distanceToRoute <= 90.0 {
+            // 放宽缓冲区（110米以内全额计入，260米以内折算计入）
+            if distanceToRoute <= 110.0 {
                 completedDistanceMeters += segDist
-            } else if distanceToRoute <= 220.0 {
-                completedDistanceMeters += segDist * 0.85
+            } else if distanceToRoute <= 260.0 {
+                completedDistanceMeters += segDist * 0.90
             }
-            if speedMps >= 0.4 && dt > 0 && dt < 30 {
+            if speedMps >= 0.3 && dt > 0 && dt < 30 {
                 movingSeconds += dt
                 movingDistance += segDist
             }
         }
         lastAcceptedLocation = location
 
-        // 5. 偏航状态与提醒（进入偏航时提醒一次，2 分钟内不重复）
-        if distanceToRoute <= 90.0 {
+        // 5. 偏航状态与提醒
+        if distanceToRoute <= 110.0 {
             offRouteNotice = nil
             isCurrentlyOffRoute = false
-        } else if distanceToRoute <= 220.0 {
-            offRouteNotice = "正在绕行缓冲带内（遇天桥/障碍可安心绕行，回到路线自动衔接）"
+        } else if distanceToRoute <= 260.0 {
+            offRouteNotice = "正在绕行缓冲带内（遇障碍可安心绕行，回到路线自动衔接）"
             isCurrentlyOffRoute = false
         } else {
-            offRouteNotice = "已偏离路线超 220 米，可回到路线或点击「中途改线」"
+            offRouteNotice = "已偏离路线超 260 米，可回到路线或点击「中途改线」"
             if !isCurrentlyOffRoute {
                 isCurrentlyOffRoute = true
                 let now = Date()
@@ -216,13 +507,13 @@ final class RouteTrackingManager: ObservableObject {
                     postLocalNotification(
                         id: "off-route",
                         title: "已偏离规划路线",
-                        body: "您已偏离路线超过 220 米，请回到路线上，或打开 App 中途改线。"
+                        body: "您已偏离路线超过 260 米，请回到路线上，或打开 App 中途改线。"
                     )
                 }
             }
         }
 
-        // 6. 顺序检查点推进
+        // 6. 顺序检查点自动推进
         advanceCheckpoints(with: coord)
 
         // 7. 自动完赛判定
@@ -232,9 +523,9 @@ final class RouteTrackingManager: ObservableObject {
             if skipOK && distanceOK {
                 stopWorkout(userProfile: userProfile, completedNaturally: true, recordStore: recordStore)
             } else if !skipOK {
-                offRouteNotice = "已到达终点，但有较多路段未经过，可手动结束或补走"
+                offRouteNotice = "已到达终点，可点击「手动确认」或结束行程"
             } else {
-                offRouteNotice = "已到达终点，但有效步行里程不足，可手动结束或继续走"
+                offRouteNotice = "已到达终点，可手动结束或继续多走一段"
             }
         }
     }
@@ -245,7 +536,6 @@ final class RouteTrackingManager: ObservableObject {
         self.offRouteNotice = "路线已中途更新，继续散步吧！"
     }
 
-    /// 获取最初出发点坐标（用于中途改线时判断是否要回到起点）
     var workoutInitialCoordinate: CLLocationCoordinate2D? {
         initialStartCoordinate
     }
@@ -262,14 +552,13 @@ final class RouteTrackingManager: ObservableObject {
         self.hasAcquiredRoute = false
         self.progressRate = 0
         self.isCurrentlyOffRoute = false
+        updateCheckpointState()
     }
 
     private func advanceCheckpoints(with coord: CLLocationCoordinate2D) {
         guard !checkpoints.isEmpty else { return }
 
-        // 首次接入路线：
-        // - 环形路线可从任意检查点起步（自动把该点旋转为起点，终点同步变为该点）
-        // - 单向路线必须从前 5 个检查点之一起步
+        // 首次接入路线
         if !hasAcquiredRoute {
             let isLoop = activeRoute?.shape == .loop
             let searchRange = isLoop ? (0..<checkpoints.count) : (0..<min(checkpoints.count, maxSkipAhead + 1))
@@ -300,11 +589,11 @@ final class RouteTrackingManager: ObservableObject {
                 nextCheckpointIndex = start + 1
             }
             hasAcquiredRoute = true
-            updateProgress()
+            updateCheckpointState()
             return
         }
 
-        // 顺序推进：只在 [next, next + maxSkipAhead] 窗口内寻找可到达的检查点，取最远的一个
+        // 顺序推进：窗口内搜索最远可到达检查点
         var advanced = true
         while advanced && nextCheckpointIndex < checkpoints.count {
             advanced = false
@@ -322,16 +611,22 @@ final class RouteTrackingManager: ObservableObject {
                 advanced = true
             }
         }
-        updateProgress()
+        updateCheckpointState()
+        saveCurrentStateToDisk(currentLocation: coord)
     }
 
-    private var effectiveEndCoordinate: CLLocationCoordinate2D? {
-        checkpoints.last
-    }
-
-    private func updateProgress() {
-        guard !checkpoints.isEmpty else { return }
+    private func updateCheckpointState() {
+        guard !checkpoints.isEmpty else {
+            progressRate = 0
+            activeCheckpointCoordinate = nil
+            currentCheckpointIndex = 0
+            totalCheckpointCount = 0
+            return
+        }
         progressRate = min(1.0, Double(nextCheckpointIndex) / Double(checkpoints.count))
+        currentCheckpointIndex = min(nextCheckpointIndex, checkpoints.count)
+        totalCheckpointCount = checkpoints.count
+        activeCheckpointCoordinate = nextCheckpointIndex < checkpoints.count ? checkpoints[nextCheckpointIndex] : checkpoints.last
     }
 
     // MARK: - 计时（基于真实时钟，后台/锁屏期间也准确）
@@ -395,7 +690,6 @@ final class RouteTrackingManager: ObservableObject {
         return list
     }
 
-    /// 点到折线的最短距离（逐段计算点到线段的垂直距离，比点到点更准确）
     private func distanceFromPointToPolyline(_ p: CLLocationCoordinate2D, _ line: [CLLocationCoordinate2D]) -> Double {
         guard line.count >= 2 else {
             return line.first.map { distance(p, $0) } ?? 0

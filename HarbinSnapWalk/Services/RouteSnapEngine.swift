@@ -151,21 +151,7 @@ final class RouteSnapEngine: ObservableObject {
                 }
             }
 
-            // 若所有备选仍需走车行道/天桥，且终点是中间锚点：尝试把锚点向两侧平移 85 米再寻路
-            if let current = selection, current.penaltyScore > 0, isIntermediateEnd {
-                let nudgedCandidates = generateSidewalkNudgeCandidates(from: legStart, target: endPoint, offsetMeters: 85.0)
-                for nudgedEnd in nudgedCandidates {
-                    if let alt = try? await requestBestPedestrianRoute(from: legStart, to: nudgedEnd),
-                       alt.route != nil,
-                       alt.penaltyScore < (selection?.penaltyScore ?? 999) {
-                        selection = alt
-                        endPoint = nudgedEnd
-                        anchors[i] = nudgedEnd
-                        totalAvoidedHazards += 1
-                        if alt.penaltyScore == 0 { break }
-                    }
-                }
-            }
+
 
             if let chosen = selection, let chosenRoute = chosen.route {
                 totalAvoidedHazards += chosen.avoidedCount
@@ -312,21 +298,7 @@ final class RouteSnapEngine: ObservableObject {
                 }
             }
 
-            // 若所有备选仍需走车行道/天桥，且终点是中间阶段目标点：尝试微移 85 米再寻路
-            if let current = selection, current.penaltyScore > 0, isIntermediateEnd {
-                let nudgedCandidates = generateSidewalkNudgeCandidates(from: legStart, target: endPoint, offsetMeters: 85.0)
-                for nudgedEnd in nudgedCandidates {
-                    if let alt = try? await requestBestPedestrianRoute(from: legStart, to: nudgedEnd),
-                       alt.route != nil,
-                       alt.penaltyScore < (selection?.penaltyScore ?? 999) {
-                        selection = alt
-                        endPoint = nudgedEnd
-                        anchors[i] = nudgedEnd
-                        totalAvoidedHazards += 1
-                        if alt.penaltyScore == 0 { break }
-                    }
-                }
-            }
+
 
             if let chosen = selection, let chosenRoute = chosen.route {
                 totalAvoidedHazards += chosen.avoidedCount
@@ -484,35 +456,21 @@ final class RouteSnapEngine: ObservableObject {
         // 1. 惩罚分（车行道 +100/处，天桥台阶 +60/处）越低越优先
         // 2. 同为 0 惩罚时，人行道正向特征分（sidewalkBonus）越高越优先
         // 3. 其次选路程更紧凑的方案
+        // 适度均衡排序准则：
+        // 优先保证用户意图路线的连贯直达，适度偏好优良人行道，若有轻微天桥提示仅记录告示而不发生离谱绕行
         let sorted = candidates.sorted { a, b in
-            if a.penaltyScore != b.penaltyScore {
-                return a.penaltyScore < b.penaltyScore
-            }
-            if a.sidewalkBonus != b.sidewalkBonus {
-                return a.sidewalkBonus > b.sidewalkBonus
-            }
-            return a.route.distance < b.route.distance
+            let costA = a.route.distance + Double(a.penaltyScore) * 1.5 - Double(a.sidewalkBonus) * 1.0
+            let costB = b.route.distance + Double(b.penaltyScore) * 1.5 - Double(b.sidewalkBonus) * 1.0
+            return costA < costB
         }
 
-        if let best = sorted.first {
-            // 允许为了避开车行道/天桥而合理绕行（距离不超过最短路线 1.85 倍或增量 <= 650 米）
-            if best.route.distance <= shortestDist * 1.85 || (best.route.distance - shortestDist) <= 650.0 {
-                let avoided = max(0, defaultAlertsCount - best.alerts.count)
-                return RouteEvaluationResult(
-                    route: best.route,
-                    remainingAlerts: best.alerts,
-                    avoidedCount: avoided,
-                    penaltyScore: best.penaltyScore
-                )
-            }
-        }
-
-        let first = candidates[0]
+        let best = sorted.first ?? candidates[0]
+        let avoided = max(0, defaultAlertsCount - best.alerts.count)
         return RouteEvaluationResult(
-            route: first.route,
-            remainingAlerts: first.alerts,
-            avoidedCount: 0,
-            penaltyScore: first.penaltyScore
+            route: best.route,
+            remainingAlerts: best.alerts,
+            avoidedCount: avoided,
+            penaltyScore: best.penaltyScore
         )
     }
 

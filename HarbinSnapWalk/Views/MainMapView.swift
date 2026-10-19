@@ -44,6 +44,14 @@ struct MainMapView: View {
     @State private var isRevisingRoute = false
     @State private var rawScreenPoints: [CGPoint] = []
     @State private var trackingState: MapTrackingState = .free
+    @State private var mapCameraHeading: Double = 0.0
+
+    private var effectiveMapHeading: Double {
+        if trackingState == .followHeading, let heading = locationManager.userHeading {
+            return heading
+        }
+        return mapCameraHeading
+    }
 
     // 模态弹窗控制
     @State private var showCityPicker = false
@@ -83,14 +91,14 @@ struct MainMapView: View {
                                         )
                                 }
 
-                                // 启动行程后：沿路线均匀呈现根据手绘行进方向的半透明微型箭头
+                                // 启动行程后：沿路线均匀呈现根据手绘行进方向的半透明微型箭头（随地图转动实时精准旋转）
                                 if trackingManager.isTracking {
                                     ForEach(route.directionalArrows) { arrow in
                                         Annotation("", coordinate: arrow.coordinate) {
                                             Image(systemName: "chevron.up")
                                                 .font(.system(size: 13, weight: .heavy))
                                                 .foregroundStyle(Color.white.opacity(0.85))
-                                                .rotationEffect(.degrees(arrow.bearingDegrees))
+                                                .rotationEffect(.degrees(arrow.bearingDegrees - effectiveMapHeading))
                                                 .shadow(color: Color.black.opacity(0.35), radius: 2, y: 1)
                                         }
                                     }
@@ -121,6 +129,70 @@ struct MainMapView: View {
                                                 .foregroundStyle(.white)
                                         }
                                         .shadow(color: .red.opacity(0.5), radius: 6)
+                                    }
+                                }
+
+                                // 当前活跃目标检查点：发光标示，支持直接点击手动确认通过（容错机制）
+                                if trackingManager.isTracking, let chkCoord = trackingManager.activeCheckpointCoordinate {
+                                    Annotation("当前检查点", coordinate: chkCoord) {
+                                        Button(action: {
+                                            trackingManager.manuallyConfirmCurrentCheckpoint(userProfile: userProfile, recordStore: recordStore)
+                                        }) {
+                                            VStack(spacing: 2) {
+                                                ZStack {
+                                                    Circle()
+                                                        .fill(Color.orange.opacity(0.25))
+                                                        .frame(width: 38, height: 38)
+                                                    Circle()
+                                                        .fill(Color.orange)
+                                                        .frame(width: 26, height: 26)
+                                                        .shadow(color: Color.orange.opacity(0.55), radius: 4)
+                                                    Image(systemName: "checkmark")
+                                                        .font(.system(size: 11, weight: .black))
+                                                        .foregroundStyle(.white)
+                                                }
+                                                Text("点此通过")
+                                                    .font(.system(size: 9, weight: .bold))
+                                                    .foregroundStyle(.white)
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(
+                                                        Capsule()
+                                                            .fill(Color.orange.opacity(0.95))
+                                                            .shadow(color: .black.opacity(0.25), radius: 2)
+                                                    )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 记录的上次暂停位置标记（重新打开软件后醒目提示）
+                                if trackingManager.isTracking, trackingManager.isPaused, let pausedCoord = trackingManager.lastPausedCoordinate {
+                                    Annotation("上次暂停处", coordinate: pausedCoord) {
+                                        VStack(spacing: 2) {
+                                            ZStack {
+                                                Circle()
+                                                    .fill(Color.orange.opacity(0.25))
+                                                    .frame(width: 38, height: 38)
+                                                Circle()
+                                                    .fill(Color.orange)
+                                                    .frame(width: 26, height: 26)
+                                                    .shadow(color: Color.orange.opacity(0.55), radius: 4)
+                                                Image(systemName: "pause.fill")
+                                                    .font(.system(size: 11, weight: .bold))
+                                                    .foregroundStyle(.white)
+                                            }
+                                            Text("上次暂停处")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .foregroundStyle(.white)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(
+                                                    Capsule()
+                                                        .fill(Color.orange.opacity(0.95))
+                                                        .shadow(color: .black.opacity(0.25), radius: 2)
+                                                )
+                                        }
                                     }
                                 }
 
@@ -211,6 +283,9 @@ struct MainMapView: View {
                         .mapControls {
                             MapCompass()
                             MapScaleView()
+                        }
+                        .onMapCameraChange(frequency: .continuous) { context in
+                            mapCameraHeading = context.camera.heading
                         }
 
                         // 阶段选点模式下的屏幕中心瞄准准星
@@ -318,6 +393,15 @@ struct MainMapView: View {
             }
             locationManager.requestAuthorization()
             pedometer.refreshTodaySteps()
+
+            // 检查并恢复之前暂停的行程（支持关闭软件后重新打开继续）
+            trackingManager.checkAndRestorePausedWorkout(userProfile: userProfile)
+            if trackingManager.isTracking {
+                locationManager.setWorkoutMode(active: true)
+                if trackingManager.hasRestoredFromPause, let pausedLoc = trackingManager.lastPausedCoordinate {
+                    locateCoordinate(pausedLoc, delta: 0.016)
+                }
+            }
         }
         .onChange(of: selectedCity) { _, newCity in
             locateCoordinate(newCity.defaultSpot.coordinate, delta: 0.020)
@@ -921,25 +1005,25 @@ struct MainMapView: View {
     // MARK: - 运动进行中：顶部极简磨砂微胶囊 HUD (最大化留白地图)
     private var activeWorkoutTopCapsule: some View {
         VStack(spacing: 6) {
-            HStack(spacing: 14) {
+            HStack(spacing: 12) {
                 // 时间
                 HStack(spacing: 4) {
                     Image(systemName: "timer")
                         .font(.caption2)
                         .foregroundStyle(.blue)
                     Text(formatSeconds(trackingManager.elapsedSeconds))
-                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
                 }
 
                 Divider().frame(height: 14)
 
-                // 距离
+                // 距离（严格按实际检测到的距离显示）
                 HStack(spacing: 4) {
                     Image(systemName: "figure.walk")
                         .font(.caption2)
                         .foregroundStyle(.green)
                     Text(String(format: "%.2f km", trackingManager.completedDistanceMeters / 1000.0))
-                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
                 }
 
                 Divider().frame(height: 14)
@@ -950,18 +1034,36 @@ struct MainMapView: View {
                         .font(.caption2)
                         .foregroundStyle(.orange)
                     Text(String(format: "%.0f kcal", trackingManager.currentCalories))
-                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
                 }
 
                 Divider().frame(height: 14)
+
+                // 检查点进度（支持点击直接手动确认通过）
+                if trackingManager.totalCheckpointCount > 0 {
+                    Button(action: {
+                        trackingManager.manuallyConfirmCurrentCheckpoint(userProfile: userProfile, recordStore: recordStore)
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.teal)
+                            Text("\(trackingManager.currentCheckpointIndex)/\(trackingManager.totalCheckpointCount)")
+                                .font(.system(size: 13, weight: .heavy, design: .rounded))
+                                .foregroundStyle(.teal)
+                        }
+                    }
+
+                    Divider().frame(height: 14)
+                }
 
                 // 进度率
                 Text(String(format: "%.0f%%", trackingManager.progressRate * 100))
                     .font(.system(size: 14, weight: .heavy, design: .rounded))
                     .foregroundStyle(.blue)
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
             .background(
                 Capsule(style: .continuous)
                     .fill(.ultraThinMaterial)
@@ -988,78 +1090,145 @@ struct MainMapView: View {
 
     // MARK: - 运动进行中：底部极简透明悬浮岛 (完全不遮挡地图)
     private var minimalActiveWorkoutDock: some View {
-        HStack(spacing: 14) {
-            // 暂停 / 继续按钮
-            Button(action: {
-                if trackingManager.isPaused {
-                    trackingManager.resumeWorkout()
-                } else {
-                    trackingManager.pauseWorkout()
+        VStack(spacing: 10) {
+            // 若为关闭软件后重新打开恢复的暂停状态，呈现恢复提示与放弃选项
+            if trackingManager.hasRestoredFromPause && trackingManager.isPaused {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(.orange)
+                    Text("已恢复上次暂停状态，可在此继续运动")
+                        .font(.caption.bold())
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    Button(action: {
+                        trackingManager.discardRestoredWorkout()
+                    }) {
+                        Text("放弃")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                    }
                 }
-            }) {
-                Image(systemName: trackingManager.isPaused ? "play.fill" : "pause.fill")
-                    .font(.title3.bold())
-                    .foregroundStyle(trackingManager.isPaused ? .green : .orange)
-                    .frame(width: 52, height: 52)
-                    .background(
-                        Circle()
-                            .fill(.ultraThinMaterial)
-                            .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.8))
-                    )
-            }
-
-            // 中途修改路线按钮
-            Button(action: startMidwayRouteRevision) {
-                HStack(spacing: 6) {
-                    Image(systemName: "pencil.and.outline")
-                        .font(.subheadline.bold())
-                    Text("中途改线")
-                        .font(.subheadline.bold())
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 20)
-                .frame(height: 52)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
                 .background(
-                    Capsule(style: .continuous)
-                        .fill(LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing))
-                        .shadow(color: .indigo.opacity(0.35), radius: 8, y: 3)
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(Color.orange.opacity(0.4), lineWidth: 1)
+                        )
+                        .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
                 )
+                .padding(.horizontal, 20)
             }
 
-            // 结束行程按钮
-            Button(action: {
-                trackingManager.stopWorkout(
-                    userProfile: userProfile,
-                    completedNaturally: false,
-                    recordStore: recordStore
-                )
-            }) {
-                Image(systemName: "stop.fill")
-                    .font(.title3.bold())
-                    .foregroundStyle(.red)
-                    .frame(width: 52, height: 52)
+            HStack(spacing: 8) {
+                // 1. 暂停 / 继续按钮 (暂停时自动记录当前定位并持久化到本地文件)
+                Button(action: {
+                    if trackingManager.isPaused {
+                        trackingManager.resumeWorkout()
+                    } else {
+                        trackingManager.pauseWorkout(currentLocation: locationManager.userLocation)
+                    }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: trackingManager.isPaused ? "play.fill" : "pause.fill")
+                            .font(.subheadline.bold())
+                        if trackingManager.isPaused {
+                            Text("继续")
+                                .font(.system(.subheadline, design: .rounded).bold())
+                        }
+                    }
+                    .foregroundStyle(trackingManager.isPaused ? .white : .orange)
+                    .frame(minWidth: 46, minHeight: 46)
+                    .padding(.horizontal, trackingManager.isPaused ? 10 : 0)
                     .background(
-                        Circle()
-                            .fill(.ultraThinMaterial)
-                            .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.8))
+                        Group {
+                            if trackingManager.isPaused {
+                                Capsule(style: .continuous)
+                                    .fill(LinearGradient(colors: [Color.green, Color.teal], startPoint: .leading, endPoint: .trailing))
+                                    .shadow(color: Color.green.opacity(0.35), radius: 6, y: 2)
+                            } else {
+                                Circle()
+                                    .fill(.ultraThinMaterial)
+                                    .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.8))
+                            }
+                        }
                     )
-            }
+                }
 
-            // 视角跟随切换按钮
-            Button(action: toggleTrackingMode) {
-                Image(systemName: trackingIconName)
-                    .font(.title3)
-                    .foregroundStyle(trackingState != .free ? Color.blue : Color.primary)
-                    .frame(width: 52, height: 52)
+                // 2. 手动强行确认通过当前检查点/路段 (用户容错机制)
+                Button(action: {
+                    trackingManager.manuallyConfirmCurrentCheckpoint(userProfile: userProfile, recordStore: recordStore)
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.subheadline.bold())
+                        Text("手动通过")
+                            .font(.system(.subheadline, design: .rounded).bold())
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .frame(height: 46)
                     .background(
-                        Circle()
-                            .fill(.ultraThinMaterial)
-                            .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.8))
+                        Capsule(style: .continuous)
+                            .fill(LinearGradient(colors: [Color.teal, Color.cyan], startPoint: .leading, endPoint: .trailing))
+                            .shadow(color: Color.teal.opacity(0.3), radius: 6, y: 2)
                     )
+                }
+
+                // 3. 中途修改路线按钮
+                Button(action: startMidwayRouteRevision) {
+                    Image(systemName: "pencil.and.outline")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 46, height: 46)
+                        .background(
+                            Circle()
+                                .fill(LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing))
+                                .shadow(color: .indigo.opacity(0.3), radius: 6, y: 2)
+                        )
+                }
+
+                // 4. 结束行程按钮
+                Button(action: {
+                    trackingManager.stopWorkout(
+                        userProfile: userProfile,
+                        completedNaturally: false,
+                        recordStore: recordStore
+                    )
+                }) {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.red)
+                        .frame(width: 46, height: 46)
+                        .background(
+                            Circle()
+                                .fill(.ultraThinMaterial)
+                                .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.8))
+                        )
+                }
+
+                // 5. 视角跟随切换按钮
+                Button(action: toggleTrackingMode) {
+                    Image(systemName: trackingIconName)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(trackingState != .free ? Color.blue : Color.primary)
+                        .frame(width: 46, height: 46)
+                        .background(
+                            Circle()
+                                .fill(.ultraThinMaterial)
+                                .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 0.8))
+                        )
+                }
             }
+            .padding(.horizontal, 16)
         }
-        .padding(.horizontal, 20)
-        .padding(.bottom, 32)
+        .padding(.bottom, 28)
     }
 
     // MARK: - 加载收藏路线并在地图取景
