@@ -7,6 +7,24 @@ enum MapTrackingState {
     case followHeading     // 视角跟随朝向旋转模式（地图随人转，前方朝上）
 }
 
+/// 阶段目标点结构体：第 0 个为起点，后续为依次串联的阶段目标
+struct PlannedWaypoint: Identifiable, Equatable {
+    let id = UUID()
+    var coordinate: CLLocationCoordinate2D
+    var index: Int
+    var isStart: Bool { index == 0 }
+    var title: String {
+        index == 0 ? "起点" : "目标 \(index)"
+    }
+
+    static func == (lhs: PlannedWaypoint, rhs: PlannedWaypoint) -> Bool {
+        lhs.id == rhs.id &&
+        lhs.coordinate.latitude == rhs.coordinate.latitude &&
+        lhs.coordinate.longitude == rhs.coordinate.longitude &&
+        lhs.index == rhs.index
+    }
+}
+
 struct MainMapView: View {
     @StateObject private var snapEngine = RouteSnapEngine()
     @StateObject private var pedometer = PedometerService()
@@ -18,6 +36,11 @@ struct MainMapView: View {
 
     @State private var selectedCity: SupportedCity = .harbin
     @State private var isDrawingMode = false
+    @State private var isWaypointMode = false
+    @State private var isWaypointLoop = true
+    @State private var plannedWaypoints: [PlannedWaypoint] = []
+    @State private var lastDrawnCoordinates: [CLLocationCoordinate2D] = []
+    @State private var customStartCoordinate: CLLocationCoordinate2D? = nil
     @State private var isRevisingRoute = false
     @State private var rawScreenPoints: [CGPoint] = []
     @State private var trackingState: MapTrackingState = .free
@@ -38,123 +61,208 @@ struct MainMapView: View {
     )
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        GeometryReader { geo in
             MapReader { mapProxy in
-                ZStack {
-                    // 底层原生 Map 容器
-                    Map(position: $cameraPosition) {
-                        UserAnnotation()
+                ZStack(alignment: .bottom) {
+                    ZStack {
+                        // 底层原生 Map 容器
+                        Map(position: $cameraPosition) {
+                            UserAnnotation()
 
-                        // 绘制当前纯净无杂枝吸附路线
-                        if let route = trackingManager.isTracking ? trackingManager.activeRoute : snapEngine.currentResult {
-                            ForEach(Array(route.polylines.enumerated()), id: \.offset) { _, polyline in
-                                MapPolyline(polyline)
+                            // 绘制当前纯净无杂枝吸附路线
+                            if let route = trackingManager.isTracking ? trackingManager.activeRoute : snapEngine.currentResult {
+                                ForEach(Array(route.polylines.enumerated()), id: \.offset) { _, polyline in
+                                    MapPolyline(polyline)
+                                        .stroke(
+                                            LinearGradient(
+                                                colors: [Color.blue, Color.cyan],
+                                                startPoint: .leading,
+                                                endPoint: .trailing
+                                            ),
+                                            style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round)
+                                        )
+                                }
+
+                                // 启动行程后：沿路线均匀呈现根据手绘行进方向的半透明微型箭头
+                                if trackingManager.isTracking {
+                                    ForEach(route.directionalArrows) { arrow in
+                                        Annotation("", coordinate: arrow.coordinate) {
+                                            Image(systemName: "chevron.up")
+                                                .font(.system(size: 13, weight: .heavy))
+                                                .foregroundStyle(Color.white.opacity(0.85))
+                                                .rotationEffect(.degrees(arrow.bearingDegrees))
+                                                .shadow(color: Color.black.opacity(0.35), radius: 2, y: 1)
+                                        }
+                                    }
+                                }
+
+                                // 起点标记
+                                if let startCoord = route.startCoordinate {
+                                    Annotation("起点", coordinate: startCoord) {
+                                        ZStack {
+                                            Circle().fill(.white).frame(width: 24, height: 24)
+                                            Circle().fill(Color.green).frame(width: 18, height: 18)
+                                            Image(systemName: "figure.walk")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .foregroundStyle(.white)
+                                        }
+                                        .shadow(color: .green.opacity(0.5), radius: 6)
+                                    }
+                                }
+
+                                // 单向路线的终点标记
+                                if route.shape == .open, let endCoord = route.endCoordinate {
+                                    Annotation("终点", coordinate: endCoord) {
+                                        ZStack {
+                                            Circle().fill(.white).frame(width: 24, height: 24)
+                                            Circle().fill(Color.red).frame(width: 18, height: 18)
+                                            Image(systemName: "flag.fill")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .foregroundStyle(.white)
+                                        }
+                                        .shadow(color: .red.opacity(0.5), radius: 6)
+                                    }
+                                }
+
+                                // 无障碍提醒标记（若某处无法避开人行天桥/地下通道/台阶，醒目提示可走附近平地斑马线）
+                                ForEach(route.barrierAlerts) { alert in
+                                    Annotation(alert.title, coordinate: alert.coordinate) {
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "exclamationmark.triangle.fill")
+                                                .font(.system(size: 10, weight: .bold))
+                                            Text(alert.title)
+                                                .font(.system(size: 10, weight: .bold))
+                                        }
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 4)
+                                        .background(
+                                            Capsule(style: .continuous)
+                                                .fill(Color.orange)
+                                                .overlay(Capsule().stroke(Color.white, lineWidth: 1))
+                                                .shadow(color: .orange.opacity(0.45), radius: 4, y: 2)
+                                        )
+                                    }
+                                }
+                            }
+
+                            // 阶段选点模式：阶段连贯虚线预览
+                            if isWaypointMode && plannedWaypoints.count >= 2 {
+                                let pts = plannedWaypoints.map { $0.coordinate } + (isWaypointLoop ? [plannedWaypoints[0].coordinate] : [])
+                                let previewPolyline = MKPolyline(coordinates: pts, count: pts.count)
+                                MapPolyline(previewPolyline)
                                     .stroke(
                                         LinearGradient(
-                                            colors: [Color.blue, Color.cyan],
+                                            colors: [Color.green, Color.cyan, Color.blue],
                                             startPoint: .leading,
                                             endPoint: .trailing
                                         ),
-                                        style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round)
+                                        style: StrokeStyle(lineWidth: 3.5, lineCap: .round, lineJoin: .round, dash: [8, 6])
                                     )
                             }
 
-                            // 启动行程后：沿路线均匀呈现根据手绘行进方向的半透明微型箭头
-                            if trackingManager.isTracking {
-                                ForEach(route.directionalArrows) { arrow in
-                                    Annotation("", coordinate: arrow.coordinate) {
-                                        Image(systemName: "chevron.up")
-                                            .font(.system(size: 13, weight: .heavy))
-                                            .foregroundStyle(Color.white.opacity(0.85))
-                                            .rotationEffect(.degrees(arrow.bearingDegrees))
-                                            .shadow(color: Color.black.opacity(0.35), radius: 2, y: 1)
+                            // 阶段选点模式：数字阶段目标标记（起点为绿，后续目标为蓝）
+                            if isWaypointMode || (!plannedWaypoints.isEmpty && snapEngine.currentResult == nil) {
+                                ForEach(plannedWaypoints) { wp in
+                                    Annotation(wp.title, coordinate: wp.coordinate) {
+                                        VStack(spacing: 2) {
+                                            ZStack {
+                                                Circle()
+                                                    .fill(wp.isStart ? Color.green : Color.blue)
+                                                    .frame(width: 32, height: 32)
+                                                    .shadow(color: (wp.isStart ? Color.green : Color.blue).opacity(0.5), radius: 6, y: 2)
+                                                Circle()
+                                                    .stroke(Color.white, lineWidth: 2)
+                                                    .frame(width: 32, height: 32)
+                                                if wp.isStart {
+                                                    Image(systemName: "figure.walk")
+                                                        .font(.system(size: 13, weight: .bold))
+                                                        .foregroundStyle(.white)
+                                                } else {
+                                                    Text("\(wp.index)")
+                                                        .font(.system(size: 14, weight: .heavy, design: .rounded))
+                                                        .foregroundStyle(.white)
+                                                }
+                                            }
+                                            Text(wp.title)
+                                                .font(.system(size: 10, weight: .bold))
+                                                .foregroundStyle(.white)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(
+                                                    Capsule()
+                                                        .fill(wp.isStart ? Color.green.opacity(0.9) : Color.blue.opacity(0.9))
+                                                        .overlay(Capsule().stroke(Color.white.opacity(0.6), lineWidth: 0.8))
+                                                        .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
+                                                )
+                                        }
                                     }
-                                }
-                            }
-
-                            // 起点标记
-                            if let startCoord = route.startCoordinate {
-                                Annotation("起点", coordinate: startCoord) {
-                                    ZStack {
-                                        Circle().fill(.white).frame(width: 24, height: 24)
-                                        Circle().fill(Color.green).frame(width: 18, height: 18)
-                                        Image(systemName: "figure.walk")
-                                            .font(.system(size: 10, weight: .bold))
-                                            .foregroundStyle(.white)
-                                    }
-                                    .shadow(color: .green.opacity(0.5), radius: 6)
-                                }
-                            }
-
-                            // 单向路线的终点标记
-                            if route.shape == .open, let endCoord = route.endCoordinate {
-                                Annotation("终点", coordinate: endCoord) {
-                                    ZStack {
-                                        Circle().fill(.white).frame(width: 24, height: 24)
-                                        Circle().fill(Color.red).frame(width: 18, height: 18)
-                                        Image(systemName: "flag.fill")
-                                            .font(.system(size: 9, weight: .bold))
-                                            .foregroundStyle(.white)
-                                    }
-                                    .shadow(color: .red.opacity(0.5), radius: 6)
-                                }
-                            }
-
-                            // 无障碍提醒标记（若某处无法避开人行天桥/地下通道/台阶，醒目提示可走附近平地斑马线）
-                            ForEach(route.barrierAlerts) { alert in
-                                Annotation(alert.title, coordinate: alert.coordinate) {
-                                    HStack(spacing: 3) {
-                                        Image(systemName: "exclamationmark.triangle.fill")
-                                            .font(.system(size: 10, weight: .bold))
-                                        Text(alert.title)
-                                            .font(.system(size: 10, weight: .bold))
-                                    }
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 4)
-                                    .background(
-                                        Capsule(style: .continuous)
-                                            .fill(Color.orange)
-                                            .overlay(Capsule().stroke(Color.white, lineWidth: 1))
-                                            .shadow(color: .orange.opacity(0.45), radius: 4, y: 2)
-                                    )
                                 }
                             }
                         }
-                    }
-                    .mapControls {
-                        MapCompass()
-                        MapScaleView()
-                    }
+                        .simultaneousGesture(
+                            SpatialTapGesture().onEnded { tapVal in
+                                guard isWaypointMode else { return }
+                                if let coord = mapProxy.convert(tapVal.location, from: .local) {
+                                    addWaypoint(coord)
+                                }
+                            }
+                        )
+                        .mapControls {
+                            MapCompass()
+                            MapScaleView()
+                        }
 
-                    // 顶层手绘画布
-                    if isDrawingMode {
-                        SketchDrawingCanvas(points: $rawScreenPoints) {
-                            handleFinishDrawing(mapProxy: mapProxy)
+                        // 阶段选点模式下的屏幕中心瞄准准星
+                        if isWaypointMode {
+                            VStack(spacing: 0) {
+                                Image(systemName: plannedWaypoints.isEmpty ? "mappin.circle.fill" : "plus.circle.fill")
+                                    .font(.system(size: 28, weight: .bold))
+                                    .foregroundStyle(plannedWaypoints.isEmpty ? Color.green : Color.blue)
+                                    .background(Circle().fill(.white).padding(2))
+                                    .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
+                                Image(systemName: "arrowtriangle.down.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(plannedWaypoints.isEmpty ? Color.green : Color.blue)
+                                    .offset(y: -4)
+                            }
+                            .allowsHitTesting(false)
+                        }
+
+                        // 顶层手绘画布
+                        if isDrawingMode {
+                            SketchDrawingCanvas(points: $rawScreenPoints) {
+                                handleFinishDrawing(mapProxy: mapProxy)
+                            }
                         }
                     }
-                }
-            }
-            .ignoresSafeArea()
+                    .ignoresSafeArea()
 
-            // 顶部导航栏 / 微胶囊 HUD
-            VStack(spacing: 8) {
-                if trackingManager.isTracking {
-                    activeWorkoutTopCapsule
-                } else {
-                    topFloatingNavBar
-                }
-                Spacer()
-            }
-            .padding(.top, 52)
-            .padding(.horizontal, 16)
+                    // 顶部导航栏 / 微胶囊 HUD
+                    VStack(spacing: 8) {
+                        if trackingManager.isTracking {
+                            activeWorkoutTopCapsule
+                        } else {
+                            topFloatingNavBar
+                        }
+                        Spacer()
+                    }
+                    .padding(.top, 52)
+                    .padding(.horizontal, 16)
 
-            // 下方中控：运动中极简浮动岛，闲置时 Apple 液态磨砂卡片
-            VStack {
-                if trackingManager.isTracking {
-                    minimalActiveWorkoutDock
-                } else {
-                    redesignedBottomCard
+                    // 下方中控：运动中极简浮动岛，选点规划模式中控，闲置时 Apple 液态磨砂卡片
+                    VStack {
+                        if trackingManager.isTracking {
+                            minimalActiveWorkoutDock
+                        } else if isWaypointMode {
+                            waypointPlanningBottomDock(
+                                mapProxy: mapProxy,
+                                centerPoint: CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
+                            )
+                        } else {
+                            redesignedBottomCard
+                        }
+                    }
                 }
             }
         }
@@ -382,6 +490,42 @@ struct MainMapView: View {
                     }
                 }
                 .padding(.vertical, 2)
+
+                // 2.5 起点归属指示与定位切换（起点自主选定，定位仅作参考）
+                HStack(spacing: 6) {
+                    Image(systemName: "mappin.circle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                    if customStartCoordinate != nil {
+                        Text("当前起点：已自定义")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Button(action: {
+                            customStartCoordinate = nil
+                            reSnapLastRoute()
+                        }) {
+                            Text("恢复手绘起点")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.blue)
+                        }
+                    } else {
+                        Text("当前起点：手绘起笔点")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        if let userLoc = locationManager.userLocation {
+                            Button(action: {
+                                customStartCoordinate = userLoc
+                                reSnapLastRoute()
+                            }) {
+                                Text("改定位为起点 (参考)")
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.blue)
+                            }
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 4)
             }
 
             // 3. 城市快捷地标微型横滑栏
@@ -406,14 +550,18 @@ struct MainMapView: View {
             }
 
             // 4. 精炼按钮栏（包含一键收藏与命名按钮）
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 if snapEngine.currentResult != nil {
                     // 清空小圆纽
-                    Button(action: { snapEngine.clear() }) {
+                    Button(action: {
+                        snapEngine.clear()
+                        customStartCoordinate = nil
+                        plannedWaypoints.removeAll()
+                    }) {
                         Image(systemName: "trash")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(.red)
-                            .frame(width: 46, height: 46)
+                            .frame(width: 44, height: 44)
                             .background(
                                 Circle()
                                     .fill(Color.red.opacity(0.1))
@@ -425,7 +573,7 @@ struct MainMapView: View {
                         Image(systemName: "bookmark")
                             .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(.orange)
-                            .frame(width: 46, height: 46)
+                            .frame(width: 44, height: 44)
                             .background(
                                 Circle()
                                     .fill(Color.orange.opacity(0.12))
@@ -461,21 +609,39 @@ struct MainMapView: View {
 
                     // 主操作 2：重新随手画
                     Button(action: {
+                        isWaypointMode = false
                         isDrawingMode = true
                         rawScreenPoints.removeAll()
                     }) {
                         Image(systemName: "pencil.tip.crop.circle")
                             .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(.blue)
-                            .frame(width: 46, height: 46)
+                            .frame(width: 44, height: 44)
                             .background(
                                 Circle()
                                     .fill(Color.blue.opacity(0.12))
                             )
                     }
-                } else {
-                    // 未画线时的核心入口按钮
+
+                    // 主操作 3：进入阶段目标选点规划
                     Button(action: {
+                        isDrawingMode = false
+                        isWaypointMode = true
+                        plannedWaypoints.removeAll()
+                    }) {
+                        Image(systemName: "point.topleft.down.to.point.bottomright.curvepath.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.purple)
+                            .frame(width: 44, height: 44)
+                            .background(
+                                Circle()
+                                    .fill(Color.purple.opacity(0.12))
+                            )
+                    }
+                } else {
+                    // 未画线时的双重核心入口：随手画线 & 选点规划
+                    Button(action: {
+                        isWaypointMode = false
                         isDrawingMode.toggle()
                         if isDrawingMode {
                             trackingState = .free
@@ -483,11 +649,11 @@ struct MainMapView: View {
                             rawScreenPoints.removeAll()
                         }
                     }) {
-                        HStack(spacing: 8) {
+                        HStack(spacing: 6) {
                             Image(systemName: isDrawingMode ? "hand.draw.fill" : "pencil.tip.crop.circle")
-                                .font(.headline)
-                            Text(isDrawingMode ? "正在画线 (松手即贴合)" : "✏️ 随手画路线")
-                                .font(.headline.bold())
+                                .font(.subheadline)
+                            Text(isDrawingMode ? "松手即贴合" : "✏️ 随手画线")
+                                .font(.system(.subheadline, design: .rounded).bold())
                         }
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
@@ -498,6 +664,29 @@ struct MainMapView: View {
                                 .shadow(color: (isDrawingMode ? Color.orange : Color.blue).opacity(0.3), radius: 8, y: 3)
                         )
                     }
+
+                    Button(action: {
+                        isDrawingMode = false
+                        isWaypointMode = true
+                        trackingState = .free
+                        locationManager.setHeadingTracking(enabled: false)
+                        plannedWaypoints.removeAll()
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "point.topleft.down.to.point.bottomright.curvepath.fill")
+                                .font(.subheadline)
+                            Text("📍 选点规划")
+                                .font(.system(.subheadline, design: .rounded).bold())
+                        }
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 50)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(LinearGradient(colors: [Color.indigo, Color.purple], startPoint: .leading, endPoint: .trailing))
+                                .shadow(color: Color.indigo.opacity(0.3), radius: 8, y: 3)
+                        )
+                    }
                 }
 
                 // 定位视角切换小圆纽
@@ -505,7 +694,7 @@ struct MainMapView: View {
                     Image(systemName: trackingIconName)
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(trackingState != .free ? .white : .primary)
-                        .frame(width: 46, height: 46)
+                        .frame(width: 44, height: 44)
                         .background(
                             Circle()
                                 .fill(trackingState != .free ? Color.blue : Color.primary.opacity(0.08))
@@ -531,6 +720,199 @@ struct MainMapView: View {
                         )
                 )
                 .shadow(color: .black.opacity(0.14), radius: 24, y: 6)
+        )
+        .padding(.horizontal, 12)
+        .padding(.bottom, 6)
+    }
+
+    // MARK: - 阶段目标选点规划专用 Apple 磨砂底部中控
+    private func waypointPlanningBottomDock(mapProxy: MapProxy, centerPoint: CGPoint) -> some View {
+        VStack(spacing: 12) {
+            // 1. 顶部模式标题与闭环切换胶囊
+            HStack {
+                HStack(spacing: 6) {
+                    Image(systemName: "point.topleft.down.to.point.bottomright.curvepath.fill")
+                        .font(.caption.bold())
+                        .foregroundStyle(.purple)
+                    Text("阶段选点路线规划")
+                        .font(.system(.subheadline, design: .rounded).bold())
+                        .foregroundStyle(.primary)
+                }
+
+                Spacer()
+
+                // 闭环 / 单向 切换胶囊
+                Button(action: {
+                    isWaypointLoop.toggle()
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: isWaypointLoop ? "arrow.triangle.2.circlepath" : "arrow.right")
+                            .font(.caption2.bold())
+                        Text(isWaypointLoop ? "环形回起点" : "单向漫步")
+                            .font(.system(.caption, design: .rounded).bold())
+                    }
+                    .foregroundStyle(isWaypointLoop ? Color.blue : Color.orange)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule()
+                            .fill((isWaypointLoop ? Color.blue : Color.orange).opacity(0.14))
+                    )
+                }
+
+                // 退出选点模式按钮
+                Button(action: {
+                    isWaypointMode = false
+                    plannedWaypoints.removeAll()
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // 2. 当前阶段点进度状态指示
+            HStack(spacing: 6) {
+                if plannedWaypoints.isEmpty {
+                    Image(systemName: "1.circle.fill").foregroundStyle(.green)
+                    Text("请点击地图放置【起点】（定位仅作参考）")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else if plannedWaypoints.count == 1 {
+                    Image(systemName: "2.circle.fill").foregroundStyle(.blue)
+                    Text("起点已设定！请点击地图放置【阶段目标 1】")
+                        .font(.footnote)
+                        .foregroundStyle(.primary)
+                } else {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.cyan)
+                    Text("已设定起点 + \(plannedWaypoints.count - 1) 个阶段目标点")
+                        .font(.footnote.bold())
+                        .foregroundStyle(.primary)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 4)
+
+            // 3. 选点辅助工具栏 (定位设为起点、中心准星添加、撤销、清空)
+            HStack(spacing: 8) {
+                // 定位作为参考：一键将起点设为当前定位
+                Button(action: {
+                    setGpsAsStartWaypoint()
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "location.fill")
+                            .font(.caption.bold())
+                        Text(plannedWaypoints.isEmpty ? "定位设起点" : "改定位起点")
+                            .font(.caption.bold())
+                    }
+                    .foregroundStyle(.green)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(
+                        Capsule()
+                            .fill(Color.green.opacity(0.12))
+                    )
+                }
+
+                // 在屏幕中心准星处添加点
+                Button(action: {
+                    if let coord = mapProxy.convert(centerPoint, from: .local) {
+                        addWaypoint(coord)
+                    }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.caption.bold())
+                        Text(plannedWaypoints.isEmpty ? "准星设起点" : "准星加目标")
+                            .font(.caption.bold())
+                    }
+                    .foregroundStyle(.blue)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(
+                        Capsule()
+                            .fill(Color.blue.opacity(0.12))
+                    )
+                }
+
+                Spacer()
+
+                // 撤销上一个点
+                Button(action: undoLastWaypoint) {
+                    Image(systemName: "arrow.uturn.backward")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(plannedWaypoints.isEmpty ? .secondary : .primary)
+                        .frame(width: 36, height: 36)
+                        .background(
+                            Circle()
+                                .fill(Color.primary.opacity(0.06))
+                        )
+                }
+                .disabled(plannedWaypoints.isEmpty)
+
+                // 清空所有点
+                Button(action: clearAllWaypoints) {
+                    Image(systemName: "trash")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(plannedWaypoints.isEmpty ? .secondary : .red)
+                        .frame(width: 36, height: 36)
+                        .background(
+                            Circle()
+                                .fill(Color.red.opacity(plannedWaypoints.isEmpty ? 0.04 : 0.12))
+                        )
+                }
+                .disabled(plannedWaypoints.isEmpty)
+            }
+
+            // 4. 大操作主按钮：串联生成总路线
+            Button(action: generateSequentialWaypointRoute) {
+                HStack(spacing: 8) {
+                    if snapEngine.isSnapping {
+                        ProgressView().tint(.white).controlSize(.small)
+                        Text("正在优选双侧人行道平路...")
+                            .font(.headline.bold())
+                    } else {
+                        Image(systemName: "sparkles")
+                            .font(.headline)
+                        Text(plannedWaypoints.count >= 2 ? "✨ 串联生成总路线 (\(plannedWaypoints.count) 个阶段)" : "请至少放置起点和 1 个阶段目标")
+                            .font(.headline.bold())
+                    }
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 50)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(
+                            plannedWaypoints.count >= 2
+                                ? LinearGradient(colors: [Color.green, Color.teal], startPoint: .leading, endPoint: .trailing)
+                                : LinearGradient(colors: [Color.gray.opacity(0.5), Color.gray.opacity(0.4)], startPoint: .leading, endPoint: .trailing)
+                        )
+                        .shadow(color: plannedWaypoints.count >= 2 ? Color.green.opacity(0.35) : Color.clear, radius: 8, y: 3)
+                )
+            }
+            .disabled(plannedWaypoints.count < 2 || snapEngine.isSnapping)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 16)
+        .padding(.bottom, 28)
+        .background(
+            RoundedRectangle(cornerRadius: 32, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 32, style: .continuous)
+                        .stroke(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.5), Color.white.opacity(0.15)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                )
+                .shadow(color: .black.opacity(0.16), radius: 24, y: 6)
         )
         .padding(.horizontal, 12)
         .padding(.bottom, 6)
@@ -686,6 +1068,9 @@ struct MainMapView: View {
         snapEngine.currentResult = result
         snapEngine.statusMessage = "已调出收藏路线「\(saved.name)」"
 
+        lastDrawnCoordinates = saved.anchorWaypoints.isEmpty ? saved.coordinates : saved.anchorWaypoints
+        customStartCoordinate = nil
+
         // 自动适配城市标签
         if let matchCity = SupportedCity.allCases.first(where: { $0.rawValue == saved.cityName }) {
             selectedCity = matchCity
@@ -718,6 +1103,78 @@ struct MainMapView: View {
         }
     }
 
+    // MARK: - 阶段选点规划与起点控制辅助函数
+    private func addWaypoint(_ coord: CLLocationCoordinate2D) {
+        let index = plannedWaypoints.count
+        let newWp = PlannedWaypoint(coordinate: coord, index: index)
+        plannedWaypoints.append(newWp)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        if index == 0 {
+            snapEngine.statusMessage = "已设定【起点】，请在地图上依次点击放置后续阶段目标点"
+        } else {
+            snapEngine.statusMessage = "已设定第 \(index) 个阶段目标，可继续点击地图添加或生成总路线"
+        }
+    }
+
+    private func setGpsAsStartWaypoint() {
+        guard let loc = locationManager.userLocation else {
+            snapEngine.statusMessage = "尚未获取到 GPS 定位信号，请稍等或直接点击地图选点"
+            return
+        }
+        if plannedWaypoints.isEmpty {
+            addWaypoint(loc)
+        } else {
+            plannedWaypoints[0].coordinate = loc
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            snapEngine.statusMessage = "已将起点设定为当前定位"
+        }
+    }
+
+    private func undoLastWaypoint() {
+        guard !plannedWaypoints.isEmpty else { return }
+        plannedWaypoints.removeLast()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        if plannedWaypoints.isEmpty {
+            snapEngine.statusMessage = "已清空点位，请点击地图放置起点"
+        } else {
+            snapEngine.statusMessage = "已撤销上一个点，当前共有 \(plannedWaypoints.count) 个点"
+        }
+    }
+
+    private func clearAllWaypoints() {
+        plannedWaypoints.removeAll()
+        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        snapEngine.statusMessage = "已清空所有阶段目标点"
+    }
+
+    private func generateSequentialWaypointRoute() {
+        guard plannedWaypoints.count >= 2 else { return }
+        let coords = plannedWaypoints.map { $0.coordinate }
+        let isLoop = isWaypointLoop
+        isWaypointMode = false
+        lastDrawnCoordinates = coords
+        customStartCoordinate = coords.first
+
+        Task {
+            await snapEngine.snapSequentialWaypointsToRoads(
+                waypoints: coords,
+                isLoop: isLoop,
+                strideLength: userProfile.effectiveStrideLength
+            )
+        }
+    }
+
+    private func reSnapLastRoute() {
+        guard !lastDrawnCoordinates.isEmpty else { return }
+        Task {
+            await snapEngine.snapUserSketchToRoads(
+                rawCoordinates: lastDrawnCoordinates,
+                startCoordinate: customStartCoordinate,
+                strideLength: userProfile.effectiveStrideLength
+            )
+        }
+    }
+
     // MARK: - 手势绘图结束处理
     private func handleFinishDrawing(mapProxy: MapProxy) {
         let coords = rawScreenPoints.compactMap { pt in
@@ -726,15 +1183,19 @@ struct MainMapView: View {
         isDrawingMode = false
         rawScreenPoints.removeAll()
 
-        guard !coords.isEmpty else { return }
+        guard coords.count >= 2 else { return }
 
-        // 核心：所有轨迹起点必须锚定在用户当前定位（若无定位则以城市第一地标为准）
-        let userPos = locationManager.userLocation ?? selectedCity.defaultSpot.coordinate
+        // 保存本次手绘原始轨迹坐标，便于后续切换起点
+        lastDrawnCoordinates = coords
+
+        // 起点完全由用户决定：若用户未指定起点，则以手绘第一笔位置为起点！定位仅作参考
+        let chosenStart = customStartCoordinate
 
         Task {
             if isRevisingRoute {
                 var finalPoints = coords
-                finalPoints.insert(userPos, at: 0)
+                let anchor = chosenStart ?? locationManager.userLocation ?? coords.first!
+                finalPoints.insert(anchor, at: 0)
 
                 if let initialStart = trackingManager.workoutInitialCoordinate,
                    let lastPt = finalPoints.last {
@@ -747,7 +1208,7 @@ struct MainMapView: View {
 
                 let newRoute = await snapEngine.snapUserSketchToRoads(
                     rawCoordinates: finalPoints,
-                    startCoordinate: userPos,
+                    startCoordinate: anchor,
                     strideLength: userProfile.effectiveStrideLength
                 )
 
@@ -758,7 +1219,7 @@ struct MainMapView: View {
             } else {
                 await snapEngine.snapUserSketchToRoads(
                     rawCoordinates: coords,
-                    startCoordinate: userPos,
+                    startCoordinate: chosenStart, // nil 即代表完全以手绘第一笔为起点！
                     strideLength: userProfile.effectiveStrideLength
                 )
             }

@@ -85,7 +85,7 @@ final class RouteSnapEngine: ObservableObject {
         snapGeneration += 1
         let myGeneration = snapGeneration
         self.isSnapping = true
-        self.statusMessage = "正在从当前定位出发，优选双侧人行道平路..."
+        self.statusMessage = "正在规划适宜步行的平路人行道..."
         defer {
             if myGeneration == snapGeneration {
                 self.isSnapping = false
@@ -245,13 +245,162 @@ final class RouteSnapEngine: ObservableObject {
 
         let routeTypeLabel = isLoopIntent ? "环形闭环" : "单向路线"
         let skipNote = skippedAnchors > 0 ? "（\(skippedAnchors) 处无路可达已绕开）" : ""
+        let originNote = startCoordinate != nil ? "已按设定起点规划" : "已按绘制起点规划"
         if !activeAlerts.isEmpty {
-            self.statusMessage = "⚠️ \(routeTypeLabel)：起点已锁定当前定位，含 \(activeAlerts.count) 处天桥/车行段\(skipNote)"
+            self.statusMessage = "⚠️ \(routeTypeLabel)：\(originNote)，含 \(activeAlerts.count) 处天桥/车行段\(skipNote)"
         } else if totalAvoidedHazards > 0 {
-            self.statusMessage = "✅ \(routeTypeLabel)：起点已锁定当前定位，已避开 \(totalAvoidedHazards) 处车行道/天桥\(skipNote)"
+            self.statusMessage = "✅ \(routeTypeLabel)：\(originNote)，已避开 \(totalAvoidedHazards) 处车行道/天桥\(skipNote)"
         } else {
-            self.statusMessage = "✅ \(routeTypeLabel)：起点已锁定当前定位，全程双侧人行道平路\(skipNote)"
+            self.statusMessage = "✅ \(routeTypeLabel)：\(originNote)，全程双侧人行道平路\(skipNote)"
         }
+        return result
+    }
+
+    /// 核心入口 2：将用户在地图上依次点选放置的阶段目标点串联吸附为总路线（起点由用户完全自主设定）
+    @discardableResult
+    func snapSequentialWaypointsToRoads(
+        waypoints: [CLLocationCoordinate2D],
+        isLoop: Bool,
+        strideLength: Double
+    ) async -> SnappedRouteResult? {
+        guard waypoints.count >= 2 else {
+            self.statusMessage = "请至少在地图上放置 1 个阶段目标点"
+            return nil
+        }
+
+        snapGeneration += 1
+        let myGeneration = snapGeneration
+        self.isSnapping = true
+        self.statusMessage = "正在串联阶段目标点并优选双侧人行道平路..."
+        defer {
+            if myGeneration == snapGeneration {
+                self.isSnapping = false
+            }
+        }
+
+        let userOrigin = waypoints[0]
+        var anchors = waypoints
+        if isLoop {
+            if distanceBetween(anchors.last!, userOrigin) > 15.0 {
+                anchors.append(userOrigin)
+            }
+        }
+
+        var rawLegs: [[CLLocationCoordinate2D]] = []
+        var rawTravelTimeSeconds: TimeInterval = 0.0
+        var rawTotalDistance: Double = 0.0
+        var candidateBarrierAlerts: [RouteBarrierAlert] = []
+        var totalAvoidedHazards: Int = 0
+        var skippedAnchors = 0
+        var wasThrottled = false
+
+        var legStart = anchors[0]
+        var i = 1
+        while i < anchors.count {
+            var endPoint = anchors[i]
+            let isIntermediateEnd = i < (anchors.count - 1)
+
+            var selection = await requestWithRetry(from: legStart, to: endPoint, throttledFlag: &wasThrottled)
+
+            if selection == nil {
+                if isIntermediateEnd {
+                    skippedAnchors += 1
+                    i += 1
+                    continue
+                } else {
+                    break
+                }
+            }
+
+            // 若所有备选仍需走车行道/天桥，且终点是中间阶段目标点：尝试微移 85 米再寻路
+            if let current = selection, current.penaltyScore > 0, isIntermediateEnd {
+                let nudgedCandidates = generateSidewalkNudgeCandidates(from: legStart, target: endPoint, offsetMeters: 85.0)
+                for nudgedEnd in nudgedCandidates {
+                    if let alt = try? await requestBestPedestrianRoute(from: legStart, to: nudgedEnd),
+                       alt.route != nil,
+                       alt.penaltyScore < (selection?.penaltyScore ?? 999) {
+                        selection = alt
+                        endPoint = nudgedEnd
+                        anchors[i] = nudgedEnd
+                        totalAvoidedHazards += 1
+                        if alt.penaltyScore == 0 { break }
+                    }
+                }
+            }
+
+            if let chosen = selection, let chosenRoute = chosen.route {
+                totalAvoidedHazards += chosen.avoidedCount
+                candidateBarrierAlerts.append(contentsOf: chosen.remainingAlerts)
+                let coords = extractCoordinates(from: chosenRoute.polyline)
+                if coords.count >= 2 {
+                    rawLegs.append(coords)
+                    rawTravelTimeSeconds += chosenRoute.expectedTravelTime
+                    rawTotalDistance += chosenRoute.distance
+                }
+            }
+            legStart = endPoint
+            i += 1
+        }
+
+        guard myGeneration == snapGeneration else { return nil }
+
+        guard !rawLegs.isEmpty else {
+            self.statusMessage = wasThrottled
+                ? "地图服务请求过于频繁，请稍等再试"
+                : "部分目标点间未匹配到适宜步行的道路，请调整目标点"
+            return nil
+        }
+
+        let stitchedDense = stitchLegsEliminatingJunctionSpurs(rawLegs)
+        var spurFreeDense = eradicateAllSpursAndHairpins(stitchedDense, isLoop: isLoop)
+
+        let stitchedLen = calculateTotalDistance(stitchedDense)
+        if stitchedLen > 0, calculateTotalDistance(spurFreeDense) < stitchedLen * 0.30 {
+            spurFreeDense = stitchedDense
+        }
+
+        let cleanedCoords = simplifyCollinearPoints(spurFreeDense, minStep: 5.5)
+        guard cleanedCoords.count >= 2 else {
+            self.statusMessage = "未匹配到适宜步行的连贯路网"
+            return nil
+        }
+
+        var finalPathCoords = cleanedCoords
+        if distanceBetween(finalPathCoords.first!, userOrigin) > 3.0 {
+            finalPathCoords.insert(userOrigin, at: 0)
+        }
+        if isLoop && distanceBetween(finalPathCoords.last!, userOrigin) > 3.0 {
+            finalPathCoords.append(userOrigin)
+        }
+
+        let activeAlerts = filterAlertsOnFinalRoute(alerts: candidateBarrierAlerts, routeCoords: finalPathCoords)
+
+        let finalDistance = calculateTotalDistance(finalPathCoords)
+        let paceRatio = rawTotalDistance > 10.0 ? (finalDistance / rawTotalDistance) : 1.0
+        let adjustedSeconds = max(60.0, rawTravelTimeSeconds * min(1.0, max(0.3, paceRatio)))
+        let finalPolyline = MKPolyline(coordinates: finalPathCoords, count: finalPathCoords.count)
+
+        var displayAnchors = anchors
+        displayAnchors[0] = userOrigin
+        if isLoop {
+            displayAnchors[displayAnchors.count - 1] = userOrigin
+        }
+
+        let result = SnappedRouteResult(
+            polylines: [finalPolyline],
+            anchorWaypoints: displayAnchors,
+            totalDistanceMeters: finalDistance,
+            estimatedTravelSeconds: adjustedSeconds,
+            strideLength: strideLength,
+            shape: isLoop ? .loop : .open,
+            barrierAlerts: activeAlerts,
+            avoidedBarrierCount: totalAvoidedHazards
+        )
+        self.currentResult = result
+
+        let targetCount = max(1, waypoints.count - 1)
+        let typeName = isLoop ? "环形目标路线" : "单向目标路线"
+        self.statusMessage = "✅ \(typeName)：已串联 \(targetCount) 个阶段目标，全程双侧人行道平路"
         return result
     }
 
