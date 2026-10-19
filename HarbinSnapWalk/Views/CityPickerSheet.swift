@@ -21,6 +21,10 @@ struct CityPickerSheet: View {
                     .pickerStyle(.segmented)
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
+                    .onChange(of: selectedCity) { _, newCity in
+                        // 切换分段时立即将地图移至该城市第一默认位置
+                        onSelectSpot(newCity.defaultSpot)
+                    }
 
                     // 预设核心地标列表
                     List {
