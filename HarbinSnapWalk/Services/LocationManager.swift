@@ -17,18 +17,18 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
     @Published var isHeadingActive: Bool = false
     @Published var authorizationStatus: CLAuthorizationStatus = .notDetermined
 
+    /// 原始定位回调（不依赖 SwiftUI 视图刷新，App 处于后台时依然可靠触发，用于行程追踪）
+    var onLocationUpdate: ((CLLocation) -> Void)?
+
     override init() {
         super.init()
         manager.delegate = self
         
-        // 核心省电配置 1：降低精度到 10 米级，大幅降低基带与卫星侦测占空比
+        // 闲置模式：10 米级精度 + 8 米触发，省电
         manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
-        
-        // 核心省电配置 2：步行 8 米才触发一次坐标推送，静止时不唤醒渲染
         manager.distanceFilter = 8.0
-        
-        // 核心省电配置 3：启用步行健身低功耗曲线
         manager.activityType = .fitness
+        // 闲置时允许系统自动暂停以省电；行程中会强制关闭（见 setWorkoutMode）
         manager.pausesLocationUpdatesAutomatically = true
         
         // 磁力计罗盘过滤阈值（偏转超过 5 度再触发更新）
@@ -41,6 +41,20 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
 
     func requestAuthorization() {
         manager.requestWhenInUseAuthorization()
+        manager.startUpdatingLocation()
+    }
+
+    /// 行程模式切换：行程中使用最高精度、禁止系统自动暂停定位（否则锁屏后 iOS 可能停止定位且不再恢复）
+    func setWorkoutMode(active: Bool) {
+        if active {
+            manager.desiredAccuracy = kCLLocationAccuracyBest
+            manager.distanceFilter = 5.0
+            manager.pausesLocationUpdatesAutomatically = false
+        } else {
+            manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+            manager.distanceFilter = 8.0
+            manager.pausesLocationUpdatesAutomatically = true
+        }
         manager.startUpdatingLocation()
     }
 
@@ -66,9 +80,9 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
 
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let latest = locations.last else { return }
-        let coord = latest.coordinate
         Task { @MainActor in
-            self.userLocation = coord
+            self.userLocation = latest.coordinate
+            self.onLocationUpdate?(latest)
         }
     }
 

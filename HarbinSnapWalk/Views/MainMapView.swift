@@ -204,20 +204,18 @@ struct MainMapView: View {
             }
         }
         .onAppear {
+            locationManager.onLocationUpdate = { [weak trackingManager, weak userProfile, weak recordStore] loc in
+                guard let tm = trackingManager, let up = userProfile, let rs = recordStore else { return }
+                tm.processLocation(loc, userProfile: up, recordStore: rs)
+            }
             locationManager.requestAuthorization()
             pedometer.refreshTodaySteps()
         }
         .onChange(of: selectedCity) { _, newCity in
             locateCoordinate(newCity.defaultSpot.coordinate, delta: 0.020)
         }
-        .onChange(of: locationManager.userLocation) { _, newLoc in
-            guard let loc = newLoc else { return }
-            trackingManager.processGPSUpdate(
-                newLocation: loc,
-                gpsSpeedMps: 0.0,
-                userProfile: userProfile,
-                recordStore: recordStore
-            )
+        .onChange(of: trackingManager.isTracking) { _, isTracking in
+            locationManager.setWorkoutMode(active: isTracking)
         }
     }
 
@@ -746,13 +744,13 @@ struct MainMapView: View {
                     }
                 }
 
-                await snapEngine.snapUserSketchToRoads(
+                let newRoute = await snapEngine.snapUserSketchToRoads(
                     rawCoordinates: finalPoints,
                     strideLength: userProfile.effectiveStrideLength
                 )
 
-                if let newRoute = snapEngine.currentResult {
-                    trackingManager.replanRouteMidway(newRoute: newRoute)
+                if let route = newRoute {
+                    trackingManager.replanRouteMidway(newRoute: route)
                 }
                 isRevisingRoute = false
             } else {

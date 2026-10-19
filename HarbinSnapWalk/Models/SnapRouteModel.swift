@@ -28,7 +28,7 @@ enum WalkSeason: String, CaseIterable, Identifiable {
 }
 
 struct RouteDirectionArrow: Identifiable {
-    let id = UUID()
+    let id: Int
     let coordinate: CLLocationCoordinate2D
     let bearingDegrees: Double
 }
@@ -50,6 +50,29 @@ struct SnappedRouteResult {
     let shape: RouteShape
     var barrierAlerts: [RouteBarrierAlert] = []
     var avoidedBarrierCount: Int = 0
+    /// 方向箭头在创建路线时一次性计算并缓存（避免每次 GPS 刷新都重算、重建全部地图标注）
+    let directionalArrows: [RouteDirectionArrow]
+
+    init(
+        polylines: [MKPolyline],
+        anchorWaypoints: [CLLocationCoordinate2D],
+        totalDistanceMeters: Double,
+        estimatedTravelSeconds: TimeInterval,
+        strideLength: Double,
+        shape: RouteShape,
+        barrierAlerts: [RouteBarrierAlert] = [],
+        avoidedBarrierCount: Int = 0
+    ) {
+        self.polylines = polylines
+        self.anchorWaypoints = anchorWaypoints
+        self.totalDistanceMeters = totalDistanceMeters
+        self.estimatedTravelSeconds = estimatedTravelSeconds
+        self.strideLength = strideLength
+        self.shape = shape
+        self.barrierAlerts = barrierAlerts
+        self.avoidedBarrierCount = avoidedBarrierCount
+        self.directionalArrows = SnappedRouteResult.buildArrows(polylines: polylines)
+    }
 
     var startCoordinate: CLLocationCoordinate2D? {
         anchorWaypoints.first
@@ -86,6 +109,10 @@ struct SnappedRouteResult {
 
     /// 提取路线所有密集折线点坐标，用于沿线追踪检测
     var allRouteCoordinates: [CLLocationCoordinate2D] {
+        SnappedRouteResult.coordinates(of: polylines)
+    }
+
+    private static func coordinates(of polylines: [MKPolyline]) -> [CLLocationCoordinate2D] {
         var coords: [CLLocationCoordinate2D] = []
         for poly in polylines {
             let pointCount = poly.pointCount
@@ -97,34 +124,45 @@ struct SnappedRouteResult {
         return coords
     }
 
-    /// 沿路线均匀分布的透明行进方向小箭头（每隔 80~100 米一个）
-    var directionalArrows: [RouteDirectionArrow] {
-        let coords = allRouteCoordinates
-        guard coords.count > 4 else { return [] }
+    /// 沿路线按真实里程均匀分布的透明行进方向小箭头（每 90 米一个，按插值精确定位）
+    private static func buildArrows(polylines: [MKPolyline]) -> [RouteDirectionArrow] {
+        let coords = coordinates(of: polylines)
+        guard coords.count >= 2 else { return [] }
 
         var arrows: [RouteDirectionArrow] = []
-        var accumulatedDistance = 0.0
-        let stepIntervalMeters = 90.0 // 每隔 90 米放置一个微型行进箭头
+        let stepIntervalMeters = 90.0
+        var nextMark = stepIntervalMeters * 0.5
+        var travelled = 0.0
 
         for i in 0..<(coords.count - 1) {
             let p1 = coords[i]
             let p2 = coords[i + 1]
             let segDist = CLLocation(latitude: p1.latitude, longitude: p1.longitude)
                 .distance(from: CLLocation(latitude: p2.latitude, longitude: p2.longitude))
-            
-            accumulatedDistance += segDist
+            guard segDist > 0.01 else { continue }
 
-            if accumulatedDistance >= stepIntervalMeters {
-                accumulatedDistance = 0.0
-                let bearing = calculateBearing(from: p1, to: p2)
-                arrows.append(RouteDirectionArrow(coordinate: p2, bearingDegrees: bearing))
+            while travelled + segDist >= nextMark {
+                let t = (nextMark - travelled) / segDist
+                let coord = CLLocationCoordinate2D(
+                    latitude: p1.latitude + (p2.latitude - p1.latitude) * t,
+                    longitude: p1.longitude + (p2.longitude - p1.longitude) * t
+                )
+                arrows.append(
+                    RouteDirectionArrow(
+                        id: arrows.count,
+                        coordinate: coord,
+                        bearingDegrees: calculateBearing(from: p1, to: p2)
+                    )
+                )
+                nextMark += stepIntervalMeters
             }
+            travelled += segDist
         }
 
         return arrows
     }
 
-    private func calculateBearing(from start: CLLocationCoordinate2D, to end: CLLocationCoordinate2D) -> Double {
+    private static func calculateBearing(from start: CLLocationCoordinate2D, to end: CLLocationCoordinate2D) -> Double {
         let lat1 = start.latitude * .pi / 180.0
         let lon1 = start.longitude * .pi / 180.0
         let lat2 = end.latitude * .pi / 180.0
