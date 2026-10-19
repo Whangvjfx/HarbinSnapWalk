@@ -129,41 +129,47 @@ struct MainMapView: View {
 
                                 // 当前活跃目标检查点：发光标示，支持直接点击手动确认通过（容错机制）
                                 if let chkCoord = trackingManager.activeCheckpointCoordinate {
-                                    Annotation("当前检查点", coordinate: chkCoord) {
+                                    Annotation("", coordinate: chkCoord) {
                                         Button(action: {
                                             trackingManager.manuallyConfirmCurrentCheckpoint(userProfile: userProfile, recordStore: recordStore)
                                         }) {
-                                            VStack(spacing: 2) {
+                                            VStack(spacing: 3) {
                                                 ZStack {
                                                     Circle()
                                                         .fill(Color.orange.opacity(0.25))
                                                         .frame(width: 38, height: 38)
                                                     Circle()
-                                                        .fill(Color.orange)
+                                                        .fill(LinearGradient(colors: [.orange, .red.opacity(0.85)], startPoint: .topLeading, endPoint: .bottomTrailing))
                                                         .frame(width: 26, height: 26)
-                                                        .shadow(color: Color.orange.opacity(0.55), radius: 4)
+                                                        .shadow(color: Color.orange.opacity(0.6), radius: 6, y: 2)
                                                     Image(systemName: "checkmark")
                                                         .font(.system(size: 11, weight: .black))
                                                         .foregroundStyle(.white)
                                                 }
-                                                Text("点此通过")
-                                                    .font(.system(size: 9, weight: .bold))
-                                                    .foregroundStyle(.white)
-                                                    .padding(.horizontal, 6)
-                                                    .padding(.vertical, 2)
-                                                    .background(
-                                                        Capsule()
-                                                            .fill(Color.orange.opacity(0.95))
-                                                            .shadow(color: .black.opacity(0.25), radius: 2)
-                                                    )
+                                                HStack(spacing: 2) {
+                                                    Image(systemName: "hand.tap.fill")
+                                                        .font(.system(size: 8, weight: .bold))
+                                                    Text("点此通过")
+                                                        .font(.system(size: 9, weight: .heavy, design: .rounded))
+                                                }
+                                                .foregroundStyle(.white)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2.5)
+                                                .background(
+                                                    Capsule()
+                                                        .fill(LinearGradient(colors: [.orange, .red.opacity(0.85)], startPoint: .leading, endPoint: .trailing))
+                                                        .overlay(Capsule().stroke(Color.white.opacity(0.6), lineWidth: 0.6))
+                                                        .shadow(color: .black.opacity(0.25), radius: 3, y: 1.5)
+                                                )
                                             }
                                         }
+                                        .buttonStyle(.plain)
                                     }
                                 }
 
                                 // 记录的上次暂停位置标记（重新打开软件后醒目提示）
                                 if trackingManager.isPaused, let pausedCoord = trackingManager.lastPausedCoordinate {
-                                    Annotation("上次暂停处", coordinate: pausedCoord) {
+                                    Annotation("", coordinate: pausedCoord) {
                                         VStack(spacing: 2) {
                                             ZStack {
                                                 Circle()
@@ -295,7 +301,7 @@ struct MainMapView: View {
                             // 阶段选点模式：数字阶段目标标记（起点为绿，后续目标为蓝）
                             if isWaypointMode || (!plannedWaypoints.isEmpty && snapEngine.currentResult == nil) {
                                 ForEach(plannedWaypoints) { wp in
-                                    Annotation(wp.title, coordinate: wp.coordinate) {
+                                    Annotation("", coordinate: wp.coordinate) {
                                         VStack(spacing: 2) {
                                             ZStack {
                                                 Circle()
@@ -389,7 +395,7 @@ struct MainMapView: View {
                         }
                         Spacer()
                     }
-                    .padding(.top, 52)
+                    .padding(.top, max(geo.safeAreaInsets.top, 44) + 6)
                     .padding(.horizontal, 16)
 
                     // 下方中控：运动中极简浮动岛，选点规划模式中控，闲置时 Apple 液态磨砂卡片
@@ -1081,68 +1087,85 @@ struct MainMapView: View {
         .padding(.bottom, 6)
     }
 
-    // MARK: - 运动进行中：顶部极简磨砂微胶囊 HUD (最大化留白地图)
+    // MARK: - 运动进行中：顶部极简磨砂微胶囊 HUD (最大化留白地图，零换行严密对齐)
     private var activeWorkoutTopCapsule: some View {
         VStack(spacing: 6) {
-            HStack(spacing: 12) {
-                // 时间
-                HStack(spacing: 4) {
+            HStack(spacing: 6) {
+                // 1. 时间
+                HStack(spacing: 3) {
                     Image(systemName: "timer")
-                        .font(.caption2)
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.blue)
                     Text(formatSeconds(trackingManager.elapsedSeconds))
-                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.primary)
                 }
 
-                Divider().frame(height: 14)
+                hudDivider
 
-                // 距离（严格按实际检测到的距离显示）
-                HStack(spacing: 4) {
+                // 2. 距离（严格按实际检测到的距离显示）
+                HStack(spacing: 2) {
                     Image(systemName: "figure.walk")
-                        .font(.caption2)
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.green)
-                    Text(String(format: "%.2f km", trackingManager.completedDistanceMeters / 1000.0))
-                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                    Text(String(format: "%.2f", trackingManager.completedDistanceMeters / 1000.0))
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.primary)
+                    Text("km")
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
                 }
 
-                Divider().frame(height: 14)
+                hudDivider
 
-                // 热量
-                HStack(spacing: 4) {
+                // 3. 热量
+                HStack(spacing: 2) {
                     Image(systemName: "flame.fill")
-                        .font(.caption2)
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.orange)
-                    Text(String(format: "%.0f kcal", trackingManager.currentCalories))
-                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                    Text(String(format: "%.0f", trackingManager.currentCalories))
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.primary)
+                    Text("kcal")
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
                 }
 
-                Divider().frame(height: 14)
-
-                // 检查点进度（支持点击直接手动确认通过）
                 if trackingManager.totalCheckpointCount > 0 {
+                    hudDivider
+
+                    // 4. 检查点进度（支持轻触直接手动确认通过）
                     Button(action: {
                         trackingManager.manuallyConfirmCurrentCheckpoint(userProfile: userProfile, recordStore: recordStore)
                     }) {
-                        HStack(spacing: 3) {
+                        HStack(spacing: 2) {
                             Image(systemName: "checkmark.circle.fill")
-                                .font(.caption2)
+                                .font(.system(size: 11, weight: .semibold))
                                 .foregroundStyle(.teal)
                             Text("\(trackingManager.currentCheckpointIndex)/\(trackingManager.totalCheckpointCount)")
-                                .font(.system(size: 13, weight: .heavy, design: .rounded))
+                                .font(.system(size: 13, weight: .bold, design: .rounded))
+                                .monospacedDigit()
                                 .foregroundStyle(.teal)
                         }
                     }
+                    .buttonStyle(.plain)
 
-                    Divider().frame(height: 14)
+                    hudDivider
+
+                    // 5. 进度百分比
+                    Text(String(format: "%.0f%%", trackingManager.progressRate * 100))
+                        .font(.system(size: 12, weight: .heavy, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.blue)
                 }
-
-                // 进度率
-                Text(String(format: "%.0f%%", trackingManager.progressRate * 100))
-                    .font(.system(size: 14, weight: .heavy, design: .rounded))
-                    .foregroundStyle(.blue)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 9)
+            .lineLimit(1)
+            .minimumScaleFactor(0.82)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
             .background(
                 Capsule(style: .continuous)
                     .fill(.ultraThinMaterial)
@@ -1156,6 +1179,8 @@ struct MainMapView: View {
                 Text(notice)
                     .font(.caption2.bold())
                     .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 4)
                     .background(
@@ -1165,6 +1190,12 @@ struct MainMapView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
+    }
+
+    private var hudDivider: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.15))
+            .frame(width: 0.8, height: 13)
     }
 
     // MARK: - 运动进行中：底部极简透明悬浮岛 (完全不遮挡地图)
@@ -1216,14 +1247,14 @@ struct MainMapView: View {
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: trackingManager.isPaused ? "play.fill" : "pause.fill")
-                            .font(.subheadline.bold())
+                            .font(.system(size: 14, weight: .bold))
                         if trackingManager.isPaused {
                             Text("继续")
-                                .font(.system(.subheadline, design: .rounded).bold())
+                                .font(.system(size: 13, weight: .bold, design: .rounded))
                         }
                     }
                     .foregroundStyle(trackingManager.isPaused ? .white : .orange)
-                    .frame(minWidth: 46, minHeight: 46)
+                    .frame(minWidth: 44, minHeight: 44)
                     .padding(.horizontal, trackingManager.isPaused ? 10 : 0)
                     .background(
                         Group {
@@ -1246,13 +1277,13 @@ struct MainMapView: View {
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: "checkmark.circle.fill")
-                            .font(.subheadline.bold())
+                            .font(.system(size: 14, weight: .bold))
                         Text("手动通过")
-                            .font(.system(.subheadline, design: .rounded).bold())
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
                     }
                     .foregroundStyle(.white)
                     .padding(.horizontal, 12)
-                    .frame(height: 46)
+                    .frame(height: 44)
                     .background(
                         Capsule(style: .continuous)
                             .fill(LinearGradient(colors: [Color.teal, Color.cyan], startPoint: .leading, endPoint: .trailing))
@@ -1263,9 +1294,9 @@ struct MainMapView: View {
                 // 3. 中途修改路线按钮
                 Button(action: startMidwayRouteRevision) {
                     Image(systemName: "pencil.and.outline")
-                        .font(.system(size: 15, weight: .bold))
+                        .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(.white)
-                        .frame(width: 46, height: 46)
+                        .frame(width: 44, height: 44)
                         .background(
                             Circle()
                                 .fill(LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing))
@@ -1282,9 +1313,9 @@ struct MainMapView: View {
                     )
                 }) {
                     Image(systemName: "stop.fill")
-                        .font(.system(size: 15, weight: .bold))
+                        .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(.red)
-                        .frame(width: 46, height: 46)
+                        .frame(width: 44, height: 44)
                         .background(
                             Circle()
                                 .fill(.ultraThinMaterial)
@@ -1295,9 +1326,9 @@ struct MainMapView: View {
                 // 5. 视角跟随切换按钮
                 Button(action: toggleTrackingMode) {
                     Image(systemName: trackingIconName)
-                        .font(.system(size: 15, weight: .medium))
+                        .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(trackingState != .free ? Color.blue : Color.primary)
-                        .frame(width: 46, height: 46)
+                        .frame(width: 44, height: 44)
                         .background(
                             Circle()
                                 .fill(.ultraThinMaterial)
@@ -1305,6 +1336,17 @@ struct MainMapView: View {
                         )
                 }
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .stroke(Color.white.opacity(0.35), lineWidth: 0.8)
+                    )
+                    .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
+            )
             .padding(.horizontal, 16)
         }
         .padding(.bottom, 28)
@@ -1555,9 +1597,14 @@ struct MainMapView: View {
 
     private func formatSeconds(_ secs: TimeInterval) -> String {
         let total = Int(secs)
-        let m = total / 60
+        let h = total / 3600
+        let m = (total % 3600) / 60
         let s = total % 60
-        return String(format: "%02d:%02d", m, s)
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, s)
+        } else {
+            return String(format: "%02d:%02d", m, s)
+        }
     }
 }
 

@@ -116,9 +116,12 @@ struct HistoryRecordsView: View {
             Text(title)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
             Text(value)
                 .font(.system(.subheadline, design: .rounded).bold())
                 .foregroundStyle(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
         }
         .frame(maxWidth: .infinity)
     }
