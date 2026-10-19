@@ -2,14 +2,27 @@ import Foundation
 import MapKit
 import CoreLocation
 
-enum WalkSeason: String, CaseIterable, Identifiable {
-    case springFall = "常规季节 (0.74m/步)"
-    case winterIce = "哈尔滨冰雪防滑 (0.68m/步)"
-    var id: String { rawValue }
-    var strideLength: Double {
+enum RouteShape: String, Codable {
+    case loop = "环形闭环路线"
+    case open = "单向通行路线"
+    
+    var iconName: String {
         switch self {
-        case .springFall: return 0.74
-        case .winterIce: return 0.68
+        case .loop: return "arrow.triangle.2.circlepath"
+        case .open: return "arrow.right"
+        }
+    }
+}
+
+enum WalkSeason: String, CaseIterable, Identifiable {
+    case springFall = "常规季节 (默认步长)"
+    case winterIce = "哈尔滨冰雪防滑 (小步紧凑)"
+    var id: String { rawValue }
+    
+    func factor(baseStride: Double) -> Double {
+        switch self {
+        case .springFall: return baseStride
+        case .winterIce: return baseStride * 0.90
         }
     }
 }
@@ -20,9 +33,18 @@ struct SnappedRouteResult {
     let totalDistanceMeters: Double
     let estimatedTravelSeconds: TimeInterval
     let strideLength: Double
+    let shape: RouteShape
+
+    var startCoordinate: CLLocationCoordinate2D? {
+        anchorWaypoints.first
+    }
+
+    var endCoordinate: CLLocationCoordinate2D? {
+        anchorWaypoints.last
+    }
 
     var estimatedSteps: Int {
-        Int(round(totalDistanceMeters / max(strideLength, 0.1)))
+        Int(round(totalDistanceMeters / max(strideLength, 0.2)))
     }
 
     var distanceKmFormatted: String {
@@ -38,5 +60,27 @@ struct SnappedRouteResult {
         } else {
             return "\(mins)分钟"
         }
+    }
+
+    /// 预估运动消耗热量 (kcal)
+    func estimatedCalories(weightKg: Double) -> Double {
+        let hours = max(0, estimatedTravelSeconds) / 3600.0
+        // 步行标准 MET 约为 3.5
+        return 3.5 * weightKg * hours
+    }
+
+    /// 提取路线所有密集折线点坐标，用于沿线追踪检测
+    var allRouteCoordinates: [CLLocationCoordinate2D] {
+        var coords: [CLLocationCoordinate2D] = []
+        for poly in polylines {
+            let pointCount = poly.pointCount
+            var points = [MKMapPoint](repeating: MKMapPoint(), count: pointCount)
+            poly.getCoordinates(&points, range: NSRange(location: 0, length: pointCount))
+            // MKMapPoint to CLLocationCoordinate2D
+            for i in 0..<pointCount {
+                coords.append(points[i].coordinate)
+            }
+        }
+        return coords
     }
 }

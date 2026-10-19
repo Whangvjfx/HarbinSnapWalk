@@ -8,6 +8,7 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
     @Published var userLocation: CLLocationCoordinate2D?
     @Published var userHeading: CLHeading?
     @Published var isHeadingActive: Bool = false
+    @Published var authorizationStatus: CLAuthorizationStatus = .notDetermined
 
     override init() {
         super.init()
@@ -17,7 +18,7 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
         manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
         
         // 核心省电配置 2：步行 10 米才触发一次坐标推送，静止时不唤醒渲染
-        manager.distanceFilter = 10.0
+        manager.distanceFilter = 8.0
         
         // 核心省电配置 3：启用步行健身低功耗曲线
         manager.activityType = .fitness
@@ -25,6 +26,10 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
         
         // 磁力计罗盘过滤阈值（偏转超过 5 度再触发更新）
         manager.headingFilter = 5.0
+
+        // 允许后台持续定位（开启行程后持续记录）
+        manager.allowsBackgroundLocationUpdates = true
+        manager.showsBackgroundLocationIndicator = true
     }
 
     func requestAuthorization() {
@@ -39,6 +44,13 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
             manager.startUpdatingHeading()
         } else {
             manager.stopUpdatingHeading()
+        }
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        self.authorizationStatus = manager.authorizationStatus
+        if manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
+            manager.startUpdatingLocation()
         }
     }
 
