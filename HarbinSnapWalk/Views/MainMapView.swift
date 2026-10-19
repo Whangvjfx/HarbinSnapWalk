@@ -693,7 +693,7 @@ struct MainMapView: View {
                 Button(action: toggleTrackingMode) {
                     Image(systemName: trackingIconName)
                         .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(trackingState != .free ? .white : .primary)
+                        .foregroundStyle(trackingState != .free ? Color.white : Color.primary)
                         .frame(width: 44, height: 44)
                         .background(
                             Circle()
@@ -843,7 +843,7 @@ struct MainMapView: View {
                 Button(action: undoLastWaypoint) {
                     Image(systemName: "arrow.uturn.backward")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(plannedWaypoints.isEmpty ? .secondary : .primary)
+                        .foregroundStyle(plannedWaypoints.isEmpty ? Color.secondary : Color.primary)
                         .frame(width: 36, height: 36)
                         .background(
                             Circle()
@@ -856,7 +856,7 @@ struct MainMapView: View {
                 Button(action: clearAllWaypoints) {
                     Image(systemName: "trash")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(plannedWaypoints.isEmpty ? .secondary : .red)
+                        .foregroundStyle(plannedWaypoints.isEmpty ? Color.secondary : Color.red)
                         .frame(width: 36, height: 36)
                         .background(
                             Circle()
@@ -1049,7 +1049,7 @@ struct MainMapView: View {
             Button(action: toggleTrackingMode) {
                 Image(systemName: trackingIconName)
                     .font(.title3)
-                    .foregroundStyle(trackingState != .free ? .blue : .primary)
+                    .foregroundStyle(trackingState != .free ? Color.blue : Color.primary)
                     .frame(width: 52, height: 52)
                     .background(
                         Circle()
@@ -1068,7 +1068,7 @@ struct MainMapView: View {
         snapEngine.currentResult = result
         snapEngine.statusMessage = "已调出收藏路线「\(saved.name)」"
 
-        lastDrawnCoordinates = saved.anchorWaypoints.isEmpty ? saved.coordinates : saved.anchorWaypoints
+        lastDrawnCoordinates = saved.coordinates
         customStartCoordinate = nil
 
         // 自动适配城市标签
