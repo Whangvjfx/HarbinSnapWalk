@@ -65,7 +65,6 @@ struct SnappedRouteResult {
     /// 预估运动消耗热量 (kcal)
     func estimatedCalories(weightKg: Double) -> Double {
         let hours = max(0, estimatedTravelSeconds) / 3600.0
-        // 步行标准 MET 约为 3.5
         return 3.5 * weightKg * hours
     }
 
@@ -74,12 +73,9 @@ struct SnappedRouteResult {
         var coords: [CLLocationCoordinate2D] = []
         for poly in polylines {
             let pointCount = poly.pointCount
-            var points = [MKMapPoint](repeating: MKMapPoint(), count: pointCount)
+            var points = [CLLocationCoordinate2D](repeating: CLLocationCoordinate2D(), count: pointCount)
             poly.getCoordinates(&points, range: NSRange(location: 0, length: pointCount))
-            // MKMapPoint to CLLocationCoordinate2D
-            for i in 0..<pointCount {
-                coords.append(points[i].coordinate)
-            }
+            coords.append(contentsOf: points)
         }
         return coords
     }

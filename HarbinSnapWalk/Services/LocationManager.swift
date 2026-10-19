@@ -1,6 +1,13 @@
 import Foundation
 import CoreLocation
 
+// 全局支持 CLLocationCoordinate2D 比较
+extension CLLocationCoordinate2D: @retroactive Equatable {
+    public static func == (lhs: CLLocationCoordinate2D, rhs: CLLocationCoordinate2D) -> Bool {
+        lhs.latitude == rhs.latitude && lhs.longitude == rhs.longitude
+    }
+}
+
 @MainActor
 final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     private let manager = CLLocationManager()
@@ -17,7 +24,7 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
         // 核心省电配置 1：降低精度到 10 米级，大幅降低基带与卫星侦测占空比
         manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
         
-        // 核心省电配置 2：步行 10 米才触发一次坐标推送，静止时不唤醒渲染
+        // 核心省电配置 2：步行 8 米才触发一次坐标推送，静止时不唤醒渲染
         manager.distanceFilter = 8.0
         
         // 核心省电配置 3：启用步行健身低功耗曲线
@@ -47,24 +54,32 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
         }
     }
 
-    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        self.authorizationStatus = manager.authorizationStatus
-        if manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
-            manager.startUpdatingLocation()
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        let status = manager.authorizationStatus
+        Task { @MainActor in
+            self.authorizationStatus = status
+            if status == .authorizedWhenInUse || status == .authorizedAlways {
+                manager.startUpdatingLocation()
+            }
         }
     }
 
-    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let latest = locations.last else { return }
-        self.userLocation = latest.coordinate
+        let coord = latest.coordinate
+        Task { @MainActor in
+            self.userLocation = coord
+        }
     }
 
-    func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
         guard newHeading.headingAccuracy >= 0 else { return }
-        self.userHeading = newHeading
+        Task { @MainActor in
+            self.userHeading = newHeading
+        }
     }
 
-    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         print("定位获取异常: \(error.localizedDescription)")
     }
 }

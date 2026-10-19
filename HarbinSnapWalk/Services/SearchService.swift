@@ -29,13 +29,16 @@ final class SearchService: NSObject, ObservableObject, MKLocalSearchCompleterDel
         completer.resultTypes = [.address, .pointOfInterest]
     }
 
-    func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
-        self.searchResults = completer.results.map { res in
+    nonisolated func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
+        let items = completer.results.map { res in
             SearchResultItem(title: res.title, subtitle: res.subtitle, coordinate: nil)
+        }
+        Task { @MainActor in
+            self.searchResults = items
         }
     }
 
-    func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
+    nonisolated func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
         print("搜索联想失败: \(error.localizedDescription)")
     }
 
