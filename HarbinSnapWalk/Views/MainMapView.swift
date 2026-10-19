@@ -48,7 +48,7 @@ struct MainMapView: View {
 
     private var effectiveMapHeading: Double {
         if trackingState == .followHeading, let heading = locationManager.userHeading {
-            return heading
+            return heading.trueHeading >= 0 ? heading.trueHeading : heading.magneticHeading
         }
         return mapCameraHeading
     }

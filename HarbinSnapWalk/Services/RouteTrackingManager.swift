@@ -143,7 +143,9 @@ final class RouteTrackingManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleAppDidEnterBackground()
+            Task { @MainActor in
+                self?.handleAppDidEnterBackground()
+            }
         }
 
         NotificationCenter.default.addObserver(
@@ -151,7 +153,9 @@ final class RouteTrackingManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleAppWillEnterForeground()
+            Task { @MainActor in
+                self?.handleAppWillEnterForeground()
+            }
         }
 
         NotificationCenter.default.addObserver(
@@ -159,7 +163,9 @@ final class RouteTrackingManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleAppWillTerminate()
+            Task { @MainActor in
+                self?.handleAppWillTerminate()
+            }
         }
     }
 
