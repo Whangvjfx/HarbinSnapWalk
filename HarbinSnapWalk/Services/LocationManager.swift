@@ -19,6 +19,8 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
 
     /// 原始定位回调（不依赖 SwiftUI 视图刷新，App 处于后台时依然可靠触发，用于行程追踪）
     var onLocationUpdate: ((CLLocation) -> Void)?
+    /// 原始罗盘朝向回调（用于地图方向箭头实时硬件级旋转）
+    var onHeadingUpdate: ((Double) -> Void)?
 
     override init() {
         super.init()
@@ -45,20 +47,25 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
     }
 
     /// 行程模式切换：行程中使用最高精度、禁止系统自动暂停定位（否则锁屏后 iOS 可能停止定位且不再恢复）
+    /// 行程模式切换：行程中使用最高精度、开启实时罗盘、禁止系统自动暂停定位（否则锁屏后 iOS 可能停止定位且不再恢复）
     func setWorkoutMode(active: Bool) {
         if active {
             manager.desiredAccuracy = kCLLocationAccuracyBest
             manager.distanceFilter = 5.0
             manager.pausesLocationUpdatesAutomatically = false
+            manager.startUpdatingHeading()
+            isHeadingActive = true
         } else {
             manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
             manager.distanceFilter = 8.0
             manager.pausesLocationUpdatesAutomatically = true
+            manager.stopUpdatingHeading()
+            isHeadingActive = false
         }
         manager.startUpdatingLocation()
     }
 
-    /// 罗盘生命周期调控：仅在「视角朝向跟随」模式下启动，避免常驻消耗磁力计功耗
+    /// 罗盘生命周期调控：显式启闭罗盘朝向
     func setHeadingTracking(enabled: Bool) {
         isHeadingActive = enabled
         if enabled {
@@ -88,8 +95,10 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
 
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
         guard newHeading.headingAccuracy >= 0 else { return }
+        let deg = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
         Task { @MainActor in
             self.userHeading = newHeading
+            self.onHeadingUpdate?(deg)
         }
     }
 

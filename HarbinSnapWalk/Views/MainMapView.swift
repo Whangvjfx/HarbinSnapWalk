@@ -25,6 +25,34 @@ struct PlannedWaypoint: Identifiable, Equatable {
     }
 }
 
+/// 独立的地图视角与航向监听器：通过 @ObservedObject 彻底穿透 MapKit 注解缓存，保证 60fps 硬件级转动
+@MainActor
+final class MapOrientationManager: ObservableObject {
+    @Published var currentHeading: Double = 0.0
+
+    func updateHeading(_ newHeading: Double) {
+        let normalized = (newHeading.truncatingRemainder(dividingBy: 360.0) + 360.0).truncatingRemainder(dividingBy: 360.0)
+        if abs(currentHeading - normalized) > 0.4 {
+            currentHeading = normalized
+        }
+    }
+}
+
+/// 动态行进方向箭头视图：独立监听朝向并实时同步旋转，永不卡滞
+struct DynamicRouteArrowView: View {
+    let bearingDegrees: Double
+    @ObservedObject var orientation: MapOrientationManager
+
+    var body: some View {
+        Image(systemName: "chevron.up")
+            .font(.system(size: 13, weight: .heavy))
+            .foregroundStyle(Color.white.opacity(0.85))
+            .rotationEffect(.degrees(bearingDegrees - orientation.currentHeading))
+            .shadow(color: Color.black.opacity(0.35), radius: 2, y: 1)
+            .id("\(Int(orientation.currentHeading / 2.0))")
+    }
+}
+
 struct MainMapView: View {
     @StateObject private var snapEngine = RouteSnapEngine()
     @StateObject private var pedometer = PedometerService()
@@ -33,6 +61,7 @@ struct MainMapView: View {
     @StateObject private var recordStore = ActivityRecordStore()
     @StateObject private var savedRouteStore = SavedRouteStore()
     @StateObject private var trackingManager = RouteTrackingManager()
+    @StateObject private var orientationManager = MapOrientationManager()
 
     @State private var selectedCity: SupportedCity = .harbin
     @State private var isDrawingMode = false
@@ -77,9 +106,9 @@ struct MainMapView: View {
                         Map(position: $cameraPosition) {
                             UserAnnotation()
 
-                            // 绘制当前纯净无杂枝吸附路线
-                            if let route = trackingManager.isTracking ? trackingManager.activeRoute : snapEngine.currentResult {
-                                ForEach(Array(route.polylines.enumerated()), id: \.offset) { _, polyline in
+                            // 1. 行程进行中：走完的路段自动消失，仅呈现剩余待走路线与前方箭头
+                            if trackingManager.isTracking {
+                                ForEach(Array(trackingManager.remainingPolylines.enumerated()), id: \.offset) { _, polyline in
                                     MapPolyline(polyline)
                                         .stroke(
                                             LinearGradient(
@@ -91,49 +120,15 @@ struct MainMapView: View {
                                         )
                                 }
 
-                                // 启动行程后：沿路线均匀呈现根据手绘行进方向的半透明微型箭头（随地图转动实时精准旋转）
-                                if trackingManager.isTracking {
-                                    ForEach(route.directionalArrows) { arrow in
-                                        Annotation("", coordinate: arrow.coordinate) {
-                                            Image(systemName: "chevron.up")
-                                                .font(.system(size: 13, weight: .heavy))
-                                                .foregroundStyle(Color.white.opacity(0.85))
-                                                .rotationEffect(.degrees(arrow.bearingDegrees - effectiveMapHeading))
-                                                .shadow(color: Color.black.opacity(0.35), radius: 2, y: 1)
-                                        }
-                                    }
-                                }
-
-                                // 起点标记
-                                if let startCoord = route.startCoordinate {
-                                    Annotation("起点", coordinate: startCoord) {
-                                        ZStack {
-                                            Circle().fill(.white).frame(width: 24, height: 24)
-                                            Circle().fill(Color.green).frame(width: 18, height: 18)
-                                            Image(systemName: "figure.walk")
-                                                .font(.system(size: 10, weight: .bold))
-                                                .foregroundStyle(.white)
-                                        }
-                                        .shadow(color: .green.opacity(0.5), radius: 6)
-                                    }
-                                }
-
-                                // 单向路线的终点标记
-                                if route.shape == .open, let endCoord = route.endCoordinate {
-                                    Annotation("终点", coordinate: endCoord) {
-                                        ZStack {
-                                            Circle().fill(.white).frame(width: 24, height: 24)
-                                            Circle().fill(Color.red).frame(width: 18, height: 18)
-                                            Image(systemName: "flag.fill")
-                                                .font(.system(size: 9, weight: .bold))
-                                                .foregroundStyle(.white)
-                                        }
-                                        .shadow(color: .red.opacity(0.5), radius: 6)
+                                // 沿剩余路线均匀呈现方向小箭头 (随地图/朝向旋转硬件级实时精准转动)
+                                ForEach(trackingManager.remainingDirectionalArrows) { arrow in
+                                    Annotation("", coordinate: arrow.coordinate) {
+                                        DynamicRouteArrowView(bearingDegrees: arrow.bearingDegrees, orientation: orientationManager)
                                     }
                                 }
 
                                 // 当前活跃目标检查点：发光标示，支持直接点击手动确认通过（容错机制）
-                                if trackingManager.isTracking, let chkCoord = trackingManager.activeCheckpointCoordinate {
+                                if let chkCoord = trackingManager.activeCheckpointCoordinate {
                                     Annotation("当前检查点", coordinate: chkCoord) {
                                         Button(action: {
                                             trackingManager.manuallyConfirmCurrentCheckpoint(userProfile: userProfile, recordStore: recordStore)
@@ -167,7 +162,7 @@ struct MainMapView: View {
                                 }
 
                                 // 记录的上次暂停位置标记（重新打开软件后醒目提示）
-                                if trackingManager.isTracking, trackingManager.isPaused, let pausedCoord = trackingManager.lastPausedCoordinate {
+                                if trackingManager.isPaused, let pausedCoord = trackingManager.lastPausedCoordinate {
                                     Annotation("上次暂停处", coordinate: pausedCoord) {
                                         VStack(spacing: 2) {
                                             ZStack {
@@ -196,7 +191,71 @@ struct MainMapView: View {
                                     }
                                 }
 
-                                // 无障碍提醒标记（若某处无法避开人行天桥/地下通道/台阶，醒目提示可走附近平地斑马线）
+                                // 行程中无障碍避障提醒标记
+                                if let route = trackingManager.activeRoute {
+                                    ForEach(route.barrierAlerts) { alert in
+                                        Annotation(alert.title, coordinate: alert.coordinate) {
+                                            HStack(spacing: 3) {
+                                                Image(systemName: "exclamationmark.triangle.fill")
+                                                    .font(.system(size: 10, weight: .bold))
+                                                Text(alert.title)
+                                                    .font(.system(size: 10, weight: .bold))
+                                            }
+                                            .foregroundStyle(.white)
+                                            .padding(.horizontal, 7)
+                                            .padding(.vertical, 4)
+                                            .background(
+                                                Capsule(style: .continuous)
+                                                    .fill(Color.orange)
+                                                    .overlay(Capsule().stroke(Color.white, lineWidth: 1))
+                                                    .shadow(color: .orange.opacity(0.45), radius: 4, y: 2)
+                                            )
+                                        }
+                                    }
+                                }
+                            } else if let route = trackingManager.showFullCompletedRoute ? trackingManager.fullRouteResult : snapEngine.currentResult {
+                                // 2. 未在行程中或刚刚走完行程：重新呈现全图完整路线
+                                ForEach(Array(route.polylines.enumerated()), id: \.offset) { _, polyline in
+                                    MapPolyline(polyline)
+                                        .stroke(
+                                            LinearGradient(
+                                                colors: [Color.blue, Color.cyan],
+                                                startPoint: .leading,
+                                                endPoint: .trailing
+                                            ),
+                                            style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round)
+                                        )
+                                }
+
+                                // 起点标记
+                                if let startCoord = route.startCoordinate {
+                                    Annotation("起点", coordinate: startCoord) {
+                                        ZStack {
+                                            Circle().fill(.white).frame(width: 24, height: 24)
+                                            Circle().fill(Color.green).frame(width: 18, height: 18)
+                                            Image(systemName: "figure.walk")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .foregroundStyle(.white)
+                                        }
+                                        .shadow(color: .green.opacity(0.5), radius: 6)
+                                    }
+                                }
+
+                                // 单向路线的终点标记
+                                if route.shape == .open, let endCoord = route.endCoordinate {
+                                    Annotation("终点", coordinate: endCoord) {
+                                        ZStack {
+                                            Circle().fill(.white).frame(width: 24, height: 24)
+                                            Circle().fill(Color.red).frame(width: 18, height: 18)
+                                            Image(systemName: "flag.fill")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .foregroundStyle(.white)
+                                        }
+                                        .shadow(color: .red.opacity(0.5), radius: 6)
+                                    }
+                                }
+
+                                // 无障碍提醒标记
                                 ForEach(route.barrierAlerts) { alert in
                                     Annotation(alert.title, coordinate: alert.coordinate) {
                                         HStack(spacing: 3) {
@@ -286,6 +345,14 @@ struct MainMapView: View {
                         }
                         .onMapCameraChange(frequency: .continuous) { context in
                             mapCameraHeading = context.camera.heading
+                            if trackingState != .followHeading {
+                                orientationManager.updateHeading(context.camera.heading)
+                            } else if let userH = locationManager.userHeading {
+                                let deg = userH.trueHeading >= 0 ? userH.trueHeading : userH.magneticHeading
+                                orientationManager.updateHeading(deg)
+                            } else {
+                                orientationManager.updateHeading(context.camera.heading)
+                            }
                         }
 
                         // 阶段选点模式下的屏幕中心瞄准准星
@@ -364,7 +431,7 @@ struct MainMapView: View {
             HistoryRecordsView(store: recordStore)
         }
         .fullScreenCover(isPresented: $showSaveRouteDialog) {
-            if let res = snapEngine.currentResult {
+            if let res = snapEngine.currentResult ?? trackingManager.fullRouteResult {
                 let defaultName = "\(selectedCity.rawValue) \(res.distanceKmFormatted) 路线"
                 SaveRouteDialogView(isPresented: $showSaveRouteDialog, defaultName: defaultName) { name in
                     savedRouteStore.saveRoute(
@@ -390,6 +457,11 @@ struct MainMapView: View {
             locationManager.onLocationUpdate = { [weak trackingManager, weak userProfile, weak recordStore] loc in
                 guard let tm = trackingManager, let up = userProfile, let rs = recordStore else { return }
                 tm.processLocation(loc, userProfile: up, recordStore: rs)
+            }
+            locationManager.onHeadingUpdate = { [weak orientationManager] heading in
+                if trackingState == .followHeading {
+                    orientationManager?.updateHeading(heading)
+                }
             }
             locationManager.requestAuthorization()
             pedometer.refreshTodaySteps()
@@ -488,12 +560,16 @@ struct MainMapView: View {
         }
     }
 
+    private var activePlanningResult: SnappedRouteResult? {
+        snapEngine.currentResult ?? (trackingManager.showFullCompletedRoute ? trackingManager.fullRouteResult : nil)
+    }
+
     // MARK: - 全新极简 Apple 风格磨砂玻璃底部卡片 (带收藏与命名触发)
     private var redesignedBottomCard: some View {
         VStack(spacing: 14) {
             // 1. 顶部状态与健康建议微标签
             HStack {
-                if let res = snapEngine.currentResult {
+                if let res = activePlanningResult {
                     HStack(spacing: 6) {
                         Image(systemName: res.shape == .loop ? "arrow.triangle.2.circlepath" : "arrow.right")
                             .font(.caption2.bold())
@@ -541,7 +617,7 @@ struct MainMapView: View {
             }
 
             // 2. 核心大字数据展示区 (Apple Health 质感)
-            if let res = snapEngine.currentResult {
+            if let res = activePlanningResult {
                 HStack(alignment: .lastTextBaseline, spacing: 6) {
                     Text(res.distanceKmFormatted.replacingOccurrences(of: " km", with: ""))
                         .font(.system(size: 38, weight: .heavy, design: .rounded))
@@ -635,12 +711,14 @@ struct MainMapView: View {
 
             // 4. 精炼按钮栏（包含一键收藏与命名按钮）
             HStack(spacing: 8) {
-                if snapEngine.currentResult != nil {
+                if let activeRes = activePlanningResult {
                     // 清空小圆纽
                     Button(action: {
                         snapEngine.clear()
                         customStartCoordinate = nil
                         plannedWaypoints.removeAll()
+                        trackingManager.showFullCompletedRoute = false
+                        trackingManager.fullRouteResult = nil
                     }) {
                         Image(systemName: "trash")
                             .font(.system(size: 15, weight: .semibold))
@@ -666,14 +744,15 @@ struct MainMapView: View {
 
                     // 主操作 1：启动行程 (优雅翠绿渐变)
                     Button(action: {
-                        if let route = snapEngine.currentResult {
-                            trackingManager.startWorkout(
-                                route: route,
-                                userProfile: userProfile,
-                                cityName: selectedCity.rawValue,
-                                currentLocation: locationManager.userLocation
-                            )
-                        }
+                        trackingManager.startWorkout(
+                            route: activeRes,
+                            userProfile: userProfile,
+                            cityName: selectedCity.rawValue,
+                            currentLocation: locationManager.userLocation
+                        )
+                        trackingState = .followLocation
+                        cameraPosition = .userLocation(fallback: .automatic)
+                        orientationManager.updateHeading(mapCameraHeading)
                     }) {
                         HStack(spacing: 6) {
                             Image(systemName: "play.fill")
@@ -1439,19 +1518,25 @@ struct MainMapView: View {
         switch trackingState {
         case .free:
             trackingState = .followLocation
-            locationManager.setHeadingTracking(enabled: false)
+            locationManager.setHeadingTracking(enabled: true)
             withAnimation {
                 cameraPosition = .userLocation(fallback: .automatic)
             }
+            orientationManager.updateHeading(mapCameraHeading)
         case .followLocation:
             trackingState = .followHeading
             locationManager.setHeadingTracking(enabled: true)
             withAnimation {
                 cameraPosition = .userLocation(followsHeading: true, fallback: .automatic)
             }
+            if let userH = locationManager.userHeading {
+                let deg = userH.trueHeading >= 0 ? userH.trueHeading : userH.magneticHeading
+                orientationManager.updateHeading(deg)
+            }
         case .followHeading:
             trackingState = .free
-            locationManager.setHeadingTracking(enabled: false)
+            locationManager.setHeadingTracking(enabled: trackingManager.isTracking)
+            orientationManager.updateHeading(mapCameraHeading)
         }
     }
 

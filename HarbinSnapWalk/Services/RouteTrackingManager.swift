@@ -79,6 +79,13 @@ final class RouteTrackingManager: ObservableObject {
     @Published var showWorkoutSummary: Bool = false
     @Published var lastCompletedRecord: ActivityRecord? = nil
 
+    // 走过即消失 & 完赛重新显示全图路线状态
+    @Published var remainingPolylines: [MKPolyline] = []
+    @Published var remainingDirectionalArrows: [RouteDirectionArrow] = []
+    @Published var showFullCompletedRoute: Bool = false
+    @Published var fullRouteResult: SnappedRouteResult? = nil
+    private var checkpointCoordIndices: [Int] = []
+
     // 断点续走与检查点容错增强状态
     @Published var lastPausedCoordinate: CLLocationCoordinate2D? = nil
     @Published var hasRestoredFromPause: Bool = false
@@ -87,8 +94,8 @@ final class RouteTrackingManager: ObservableObject {
     @Published var totalCheckpointCount: Int = 0
 
     // MARK: - 判定参数（宽容且鲁棒的检查点容错机制）
-    /// 检查点到达判定半径：放宽至 55 米，覆盖多车道马路对侧、树荫遮挡及偶发 GPS 漂移
-    private let reachRadius: Double = 55.0
+    /// 检查点到达判定半径：放宽至 60 米，覆盖多车道马路对侧、树荫遮挡及偶发 GPS 漂移
+    private let reachRadius: Double = 60.0
     /// 允许向前跳过的检查点数量（4 × 60 米 ≈ 240 米），用于绕开施工围挡、天桥
     private let maxSkipAhead: Int = 4
     /// 全程累计跳过的检查点上限比例
@@ -296,7 +303,10 @@ final class RouteTrackingManager: ObservableObject {
         self.isPaused = false
         self.hasRestoredFromPause = false
         self.lastPausedCoordinate = nil
-        self.offRouteNotice = nil
+        self.showFullCompletedRoute = true // 走完全程，重新在地图上完整呈现全图路线！
+        self.remainingPolylines = []
+        self.remainingDirectionalArrows = []
+        self.offRouteNotice = "🎉 行程已圆满完成！已重新呈现全城轨迹全貌"
         clearPausedState()
 
         if completedNaturally {
@@ -314,7 +324,7 @@ final class RouteTrackingManager: ObservableObject {
 
         if !hasAcquiredRoute {
             hasAcquiredRoute = true
-            nextCheckpointIndex = 1
+            nextCheckpointIndex = min(1, checkpoints.count)
             self.offRouteNotice = "✔️ 已手动确认开始并接入路线"
         } else if nextCheckpointIndex < checkpoints.count {
             nextCheckpointIndex += 1
@@ -332,6 +342,7 @@ final class RouteTrackingManager: ObservableObject {
         }
 
         updateCheckpointState()
+        updateRemainingRoute(currentLocation: lastAcceptedLocation?.coordinate)
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         saveCurrentStateToDisk(currentLocation: lastAcceptedLocation?.coordinate)
     }
@@ -414,6 +425,7 @@ final class RouteTrackingManager: ObservableObject {
             self.hasRestoredFromPause = true
             self.offRouteNotice = "已恢复上次暂停的行程，点击「继续运动」即可继续！"
             updateCheckpointState()
+            updateRemainingRoute(currentLocation: session.pausedCoordinate)
             return true
         } catch {
             print("恢复暂停行程异常: \(error)")
@@ -431,6 +443,10 @@ final class RouteTrackingManager: ObservableObject {
         self.hasRestoredFromPause = false
         self.lastPausedCoordinate = nil
         self.activeRoute = nil
+        self.remainingPolylines = []
+        self.remainingDirectionalArrows = []
+        self.showFullCompletedRoute = false
+        self.fullRouteResult = nil
         self.offRouteNotice = nil
         updateCheckpointState()
     }
@@ -550,15 +566,20 @@ final class RouteTrackingManager: ObservableObject {
 
     private func loadRoute(_ route: SnappedRouteResult) {
         self.activeRoute = route
+        self.fullRouteResult = route
+        self.showFullCompletedRoute = false
         self.routeCoords = route.allRouteCoordinates
         self.routeLengthMeters = route.totalDistanceMeters
-        self.checkpoints = extractCheckpoints(from: routeCoords, stepMeters: 60.0)
+        let extracted = extractCheckpoints(from: routeCoords, stepMeters: 60.0)
+        self.checkpoints = extracted.checkpoints
+        self.checkpointCoordIndices = extracted.indices
         self.nextCheckpointIndex = 0
         self.skippedCheckpointCount = 0
         self.hasAcquiredRoute = false
         self.progressRate = 0
         self.isCurrentlyOffRoute = false
         updateCheckpointState()
+        updateRemainingRoute(currentLocation: initialStartCoordinate)
     }
 
     private func advanceCheckpoints(with coord: CLLocationCoordinate2D) {
@@ -572,53 +593,116 @@ final class RouteTrackingManager: ObservableObject {
             var bestDist = Double.greatestFiniteMagnitude
             for k in searchRange {
                 let d = distance(coord, checkpoints[k])
-                if d <= reachRadius && d < bestDist {
+                if d <= max(reachRadius, 90.0) && d < bestDist {
                     bestDist = d
                     bestIdx = k
                 }
             }
             guard let start = bestIdx else {
                 if offRouteNotice == nil {
-                    offRouteNotice = isLoop ? "请先走到路线上的任意位置开始" : "请先前往路线起点（绿色标记）开始"
+                    offRouteNotice = isLoop ? "请先走到路线上的任意位置开始" : "请先前往路线起点附近开始"
                 }
                 return
             }
             if isLoop && start != 0 {
                 var ring = checkpoints
+                var ringIndices = checkpointCoordIndices
                 if ring.count > 2, distance(ring.first!, ring.last!) <= 20.0 {
                     ring.removeLast()
+                    ringIndices.removeLast()
                 }
                 let s = min(start, ring.count - 1)
                 checkpoints = Array(ring[s...]) + Array(ring[..<s]) + [ring[s]]
+                checkpointCoordIndices = Array(ringIndices[s...]) + Array(ringIndices[..<s]) + [ringIndices[s]]
                 nextCheckpointIndex = 1
             } else {
-                nextCheckpointIndex = start + 1
+                nextCheckpointIndex = start
             }
             hasAcquiredRoute = true
             updateCheckpointState()
+            updateRemainingRoute(currentLocation: coord)
             return
         }
 
-        // 顺序推进：窗口内搜索最远可到达检查点
-        var advanced = true
-        while advanced && nextCheckpointIndex < checkpoints.count {
-            advanced = false
-            let upper = min(checkpoints.count - 1, nextCheckpointIndex + maxSkipAhead)
-            var reached: Int? = nil
-            for k in stride(from: upper, through: nextCheckpointIndex, by: -1) {
-                if distance(coord, checkpoints[k]) <= reachRadius {
-                    reached = k
-                    break
-                }
-            }
-            if let k = reached {
-                skippedCheckpointCount += (k - nextCheckpointIndex)
-                nextCheckpointIndex = k + 1
-                advanced = true
+        // 顺序推进：系统自动检测当前及前方允许窗口内的检查点是否已到达
+        var advanced = false
+        let upper = min(checkpoints.count - 1, nextCheckpointIndex + maxSkipAhead)
+        var reached: Int? = nil
+        for k in stride(from: upper, through: nextCheckpointIndex, by: -1) {
+            if distance(coord, checkpoints[k]) <= reachRadius {
+                reached = k
+                break
             }
         }
-        updateCheckpointState()
-        saveCurrentStateToDisk(currentLocation: coord)
+        if let k = reached {
+            skippedCheckpointCount += (k - nextCheckpointIndex)
+            nextCheckpointIndex = k + 1
+            advanced = true
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            let remaining = max(0, checkpoints.count - nextCheckpointIndex)
+            if remaining > 0 {
+                self.offRouteNotice = "✔️ 自动通过检查点 (\(nextCheckpointIndex)/\(checkpoints.count))"
+            } else {
+                self.offRouteNotice = "🎉 已到达终点！"
+            }
+        }
+
+        if advanced {
+            updateCheckpointState()
+            updateRemainingRoute(currentLocation: coord)
+            saveCurrentStateToDisk(currentLocation: coord)
+        }
+    }
+
+    // MARK: - 动态计算剩余待走路线（已走过的路段消失，只显示前方路线与对应箭头）
+    func updateRemainingRoute(currentLocation: CLLocationCoordinate2D? = nil) {
+        guard let route = activeRoute, !routeCoords.isEmpty else {
+            self.remainingPolylines = []
+            self.remainingDirectionalArrows = []
+            return
+        }
+
+        // 1. 若尚未走过任何检查点，整条路线均为剩余路线
+        guard nextCheckpointIndex > 0 else {
+            self.remainingPolylines = route.polylines
+            self.remainingDirectionalArrows = route.directionalArrows
+            return
+        }
+
+        // 2. 若所有检查点都已走过，剩余待走路线为空
+        guard nextCheckpointIndex < checkpoints.count,
+              nextCheckpointIndex < checkpointCoordIndices.count else {
+            self.remainingPolylines = []
+            self.remainingDirectionalArrows = []
+            return
+        }
+
+        // 3. 取出当前活跃检查点在全部折线中的切分点，之前的路段全部切除消失
+        let startIdx = checkpointCoordIndices[nextCheckpointIndex]
+        guard startIdx < routeCoords.count else {
+            self.remainingPolylines = []
+            self.remainingDirectionalArrows = []
+            return
+        }
+
+        var remainingCoords = Array(routeCoords[startIdx...])
+        // 若用户当前位置离路线前方较近（80米内），把用户当前点作为剩余路线的起点，视觉平滑连贯
+        if let loc = currentLocation ?? lastAcceptedLocation?.coordinate {
+            let d = distance(loc, remainingCoords[0])
+            if d <= 80.0 && d > 2.0 {
+                remainingCoords.insert(loc, at: 0)
+            }
+        }
+
+        guard remainingCoords.count >= 2 else {
+            self.remainingPolylines = []
+            self.remainingDirectionalArrows = []
+            return
+        }
+
+        let poly = MKPolyline(coordinates: remainingCoords, count: remainingCoords.count)
+        self.remainingPolylines = [poly]
+        self.remainingDirectionalArrows = SnappedRouteResult.buildArrows(polylines: [poly])
     }
 
     private func updateCheckpointState() {
@@ -679,21 +763,26 @@ final class RouteTrackingManager: ObservableObject {
     }
 
     // MARK: - 几何辅助
-    private func extractCheckpoints(from coords: [CLLocationCoordinate2D], stepMeters: Double) -> [CLLocationCoordinate2D] {
-        guard coords.count > 1 else { return coords }
+    private func extractCheckpoints(from coords: [CLLocationCoordinate2D], stepMeters: Double) -> (checkpoints: [CLLocationCoordinate2D], indices: [Int]) {
+        guard coords.count > 1 else {
+            return (coords, coords.isEmpty ? [] : [0])
+        }
         var list: [CLLocationCoordinate2D] = [coords[0]]
+        var indices: [Int] = [0]
         var travelled = 0.0
         for i in 1..<coords.count {
             travelled += distance(coords[i - 1], coords[i])
             if travelled >= stepMeters {
                 list.append(coords[i])
+                indices.append(i)
                 travelled = 0
             }
         }
         if let lastPt = coords.last, distance(list.last!, lastPt) > 15.0 {
             list.append(lastPt)
+            indices.append(coords.count - 1)
         }
-        return list
+        return (list, indices)
     }
 
     private func distanceFromPointToPolyline(_ p: CLLocationCoordinate2D, _ line: [CLLocationCoordinate2D]) -> Double {
